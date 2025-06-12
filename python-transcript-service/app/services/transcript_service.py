@@ -11,14 +11,17 @@ import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-# Import will be used in Phase 2 when we implement the actual functionality
-# from youtube_transcript_api import YouTubeTranscriptApi
-# from youtube_transcript_api._errors import (
-#     TranscriptsDisabled,
-#     NoTranscriptFound,
-#     VideoUnavailable,
-#     TooManyRequests
-# )
+# YouTube Transcript API imports
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    TranscriptsDisabled,
+    NoTranscriptFound,
+    VideoUnavailable,
+    TooManyRequests,
+    CouldNotRetrieveTranscript,
+    NotTranslatable,
+    TranslationLanguageNotAvailable
+)
 
 from ..models import (
     TranscriptResponse,
@@ -99,6 +102,16 @@ class TranscriptService:
     def __init__(self):
         """Initialize the transcript service"""
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        
+        # Verify YouTube Transcript API imports
+        try:
+            # This will raise ImportError if the package is not properly installed
+            YouTubeTranscriptApi
+            self.logger.info("✅ YouTube Transcript API successfully imported")
+        except ImportError as e:
+            self.logger.error(f"❌ Failed to import YouTube Transcript API: {e}")
+            raise
+        
         self.request_timeout = int(os.getenv("TRANSCRIPT_FETCH_TIMEOUT", 60))
         self.rate_limit_requests = int(os.getenv("RATE_LIMIT_REQUESTS", 100))
         self.rate_limit_window = int(os.getenv("RATE_LIMIT_WINDOW", 60))
