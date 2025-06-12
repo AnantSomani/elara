@@ -272,29 +272,111 @@ class TranscriptService:
         language: str
     ) -> List[Dict[str, Any]]:
         """
-        Fetch raw transcript data from YouTube (Phase 2 implementation)
+        Fetch transcript from YouTube using youtube-transcript-api
         
         Args:
-            video_id: Clean YouTube video ID
-            language: Language code
+            video_id: YouTube video ID
+            language: Requested language code
             
         Returns:
-            Raw transcript data
+            List of transcript segments with text and timing information
+            
+        Raises:
+            VideoUnavailableError: If video doesn't exist
+            TranscriptDisabledError: If transcripts are disabled
+            NoTranscriptFoundError: If no transcript available
+            LanguageNotFoundError: If language not available
+            RateLimitError: If rate limited
         """
-        # TODO: Phase 2 - Implement actual YouTube API calls
-        # This is a placeholder that will be replaced with actual implementation
-        
-        self.logger.debug(f"🔄 [PLACEHOLDER] Fetching from YouTube API: {video_id}, language: {language}")
-        
-        # Simulate API delay
-        await self._simulate_api_delay()
-        
-        # Return placeholder data for testing
-        return [
-            {"text": "Hello and welcome to this video", "start": 0.0, "duration": 3.5},
-            {"text": "This is a placeholder transcript", "start": 3.5, "duration": 4.0},
-            {"text": "Real implementation coming in Phase 2", "start": 7.5, "duration": 4.5}
-        ]
+        try:
+            self.logger.info(f"🎯 Attempting to fetch transcript for video {video_id} in language {language}")
+            
+            # Get list of available transcripts
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            
+            # Try to find the best available transcript
+            try:
+                # 1. Try manual transcript in requested language
+                self.logger.debug(f"Looking for manual transcript in {language}")
+                transcript = transcript_list.find_transcript([language])
+                self.logger.info(f"✅ Found manual transcript in {language}")
+                
+            except NoTranscriptFound:
+                try:
+                    # 2. Try auto-generated transcript in requested language
+                    self.logger.debug(f"Looking for auto-generated transcript in {language}")
+                    transcript = transcript_list.find_generated_transcript([language])
+                    self.logger.info(f"✅ Found auto-generated transcript in {language}")
+                    
+                except NoTranscriptFound:
+                    try:
+                        # 3. Try English manual transcript
+                        self.logger.debug("Looking for English manual transcript")
+                        transcript = transcript_list.find_transcript(['en'])
+                        self.logger.info("✅ Found English manual transcript")
+                        
+                    except NoTranscriptFound:
+                        try:
+                            # 4. Try English auto-generated transcript
+                            self.logger.debug("Looking for English auto-generated transcript")
+                            transcript = transcript_list.find_generated_transcript(['en'])
+                            self.logger.info("✅ Found English auto-generated transcript")
+                            
+                        except NoTranscriptFound:
+                            # 5. Get any available manual transcript
+                            self.logger.debug("Looking for any available manual transcript")
+                            available = transcript_list._manually_created_transcripts
+                            if available:
+                                transcript = list(available.values())[0]
+                                self.logger.info(f"✅ Found manual transcript in {transcript.language_code}")
+                            else:
+                                # 6. Get any available auto-generated transcript
+                                self.logger.debug("Looking for any available auto-generated transcript")
+                                available = transcript_list._generated_transcripts
+                                if available:
+                                    transcript = list(available.values())[0]
+                                    self.logger.info(f"✅ Found auto-generated transcript in {transcript.language_code}")
+                                else:
+                                    self.logger.error(f"❌ No transcripts available for video {video_id}")
+                                    raise NoTranscriptFoundError(video_id, language)
+            
+            # Fetch the actual transcript data
+            self.logger.debug(f"Fetching transcript data for {video_id}")
+            raw_transcript = transcript.fetch()
+            
+            # Log success with transcript details
+            self.logger.info(
+                f"✅ Successfully fetched transcript for {video_id} "
+                f"(language: {transcript.language_code}, "
+                f"type: {'auto-generated' if transcript.is_generated else 'manual'}, "
+                f"segments: {len(raw_transcript)})"
+            )
+            
+            return raw_transcript
+            
+        except VideoUnavailable:
+            self.logger.error(f"❌ Video {video_id} is unavailable")
+            raise VideoUnavailableError(video_id)
+            
+        except TranscriptsDisabled:
+            self.logger.error(f"❌ Transcripts are disabled for video {video_id}")
+            raise TranscriptDisabledError(video_id)
+            
+        except NoTranscriptFound:
+            self.logger.error(f"❌ No transcript found for video {video_id} in language {language}")
+            raise NoTranscriptFoundError(video_id, language)
+            
+        except TooManyRequests:
+            self.logger.error(f"❌ Rate limit exceeded for video {video_id}")
+            raise RateLimitError(video_id)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Unexpected error fetching transcript for {video_id}: {str(e)}", exc_info=True)
+            raise TranscriptServiceError(
+                f"Failed to fetch transcript: {str(e)}",
+                video_id=video_id,
+                status_code=500
+            )
     
     async def _get_languages_from_youtube(self, video_id: str) -> List[LanguageInfo]:
         """
