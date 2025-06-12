@@ -10,6 +10,9 @@ import time
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from enum import Enum
+from dataclasses import dataclass
+import uuid
 
 # YouTube Transcript API imports
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -34,64 +37,233 @@ from ..utils.youtube_utils import extract_video_id, sanitize_video_id
 logger = logging.getLogger(__name__)
 
 
-class TranscriptServiceError(Exception):
-    """Base exception for transcript service errors"""
-    def __init__(self, message: str, video_id: Optional[str] = None, status_code: int = 500):
+class ErrorSeverity(Enum):
+    """Error severity levels for enhanced error handling"""
+    LOW = "low"           # Minor issues, automatic retry recommended
+    MEDIUM = "medium"     # Service degradation, manual intervention may help
+    HIGH = "high"         # Service failure, immediate attention needed
+    CRITICAL = "critical" # System-wide impact, urgent escalation required
+
+
+class ErrorCategory(Enum):
+    """Error categories for intelligent error handling"""
+    RECOVERABLE = "recoverable"       # Can be retried
+    NON_RECOVERABLE = "non_recoverable"  # Should not be retried
+    RATE_LIMITED = "rate_limited"     # Needs backoff strategy
+    CONFIGURATION = "configuration"   # Setup/config issue
+    EXTERNAL = "external"            # Third-party service issue
+
+
+@dataclass
+class ErrorContext:
+    """Structured error context for debugging and recovery"""
+    video_id: Optional[str] = None
+    language: Optional[str] = None
+    attempt_number: Optional[int] = None
+    api_response_code: Optional[int] = None
+    api_response_headers: Optional[Dict[str, str]] = None
+    processing_duration_ms: Optional[float] = None
+    user_agent: Optional[str] = None
+    timestamp: Optional[str] = None
+    request_id: Optional[str] = None
+    
+    def __post_init__(self):
+        """Set default values after initialization"""
+        if self.timestamp is None:
+            self.timestamp = datetime.utcnow().isoformat()
+        if self.request_id is None:
+            self.request_id = str(uuid.uuid4())
+
+
+class EnhancedTranscriptError(Exception):
+    """Enhanced transcript error with severity, category, and recovery context"""
+    
+    def __init__(
+        self,
+        message: str,
+        video_id: Optional[str] = None,
+        status_code: int = 500,
+        severity: ErrorSeverity = ErrorSeverity.MEDIUM,
+        category: ErrorCategory = ErrorCategory.EXTERNAL,
+        recovery_suggestions: List[str] = None,
+        context: ErrorContext = None,
+        original_error: Exception = None
+    ):
+        super().__init__(message)
         self.message = message
         self.video_id = video_id
         self.status_code = status_code
-        super().__init__(self.message)
+        self.severity = severity
+        self.category = category
+        self.recovery_suggestions = recovery_suggestions or []
+        self.context = context or ErrorContext(video_id=video_id)
+        self.original_error = original_error
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert error to structured dictionary for logging/API responses"""
+        return {
+            "error": self.message,
+            "video_id": self.video_id,
+            "status_code": self.status_code,
+            "severity": self.severity.value,
+            "category": self.category.value,
+            "recovery_suggestions": self.recovery_suggestions,
+            "context": self.context.__dict__ if self.context else None,
+            "original_error": str(self.original_error) if self.original_error else None,
+            "error_type": self.__class__.__name__
+        }
+    
+    def is_recoverable(self) -> bool:
+        """Check if this error type is recoverable"""
+        return self.category in [ErrorCategory.RECOVERABLE, ErrorCategory.RATE_LIMITED]
 
 
-class VideoUnavailableError(TranscriptServiceError):
-    """Raised when video is unavailable or doesn't exist"""
-    def __init__(self, video_id: str):
+class EnhancedVideoUnavailableError(EnhancedTranscriptError):
+    """Enhanced video unavailable error with specific recovery suggestions"""
+    def __init__(self, video_id: str, context: ErrorContext = None):
         super().__init__(
-            f"Video {video_id} is unavailable or doesn't exist",
+            message=f"Video {video_id} is unavailable or doesn't exist",
             video_id=video_id,
-            status_code=404
+            status_code=404,
+            severity=ErrorSeverity.LOW,
+            category=ErrorCategory.NON_RECOVERABLE,
+            recovery_suggestions=[
+                "Verify the video ID is correct",
+                "Check if the video is public",
+                "Ensure the video hasn't been deleted",
+                "Try with a different video ID"
+            ],
+            context=context
         )
 
 
-class TranscriptDisabledError(TranscriptServiceError):
-    """Raised when transcripts are disabled for the video"""
-    def __init__(self, video_id: str):
+class EnhancedTranscriptDisabledError(EnhancedTranscriptError):
+    """Enhanced transcript disabled error with specific recovery suggestions"""
+    def __init__(self, video_id: str, context: ErrorContext = None):
         super().__init__(
-            f"Transcripts are disabled for video {video_id}",
+            message=f"Transcripts are disabled for video {video_id}",
             video_id=video_id,
-            status_code=404
+            status_code=404,
+            severity=ErrorSeverity.LOW,
+            category=ErrorCategory.NON_RECOVERABLE,
+            recovery_suggestions=[
+                "Check if the video has captions enabled",
+                "Try a different video with available transcripts",
+                "Contact the video owner to enable captions",
+                "Use auto-generated captions if available"
+            ],
+            context=context
         )
 
 
-class NoTranscriptFoundError(TranscriptServiceError):
-    """Raised when no transcript is available for the video"""
-    def __init__(self, video_id: str, language: str):
+class EnhancedRateLimitError(EnhancedTranscriptError):
+    """Enhanced rate limit error with intelligent backoff suggestions"""
+    def __init__(
+        self, 
+        video_id: str, 
+        retry_after: Optional[int] = None,
+        context: ErrorContext = None
+    ):
+        retry_message = f" Retry after {retry_after} seconds." if retry_after else ""
         super().__init__(
-            f"No transcript found for video {video_id} in language '{language}'",
+            message=f"Rate limit exceeded for video {video_id}.{retry_message}",
             video_id=video_id,
-            status_code=404
+            status_code=429,
+            severity=ErrorSeverity.MEDIUM,
+            category=ErrorCategory.RATE_LIMITED,
+            recovery_suggestions=[
+                f"Wait {retry_after or 60} seconds before retrying" if retry_after else "Wait and retry with exponential backoff",
+                "Implement client-side rate limiting",
+                "Consider using multiple API keys if available",
+                "Batch requests to reduce API calls"
+            ],
+            context=context
+        )
+        self.retry_after = retry_after
+
+
+class EnhancedNoTranscriptFoundError(EnhancedTranscriptError):
+    """Enhanced no transcript found error with specific recovery suggestions"""
+    def __init__(self, video_id: str, language: str, context: ErrorContext = None):
+        super().__init__(
+            message=f"No transcript found for video {video_id} in language '{language}'",
+            video_id=video_id,
+            status_code=404,
+            severity=ErrorSeverity.MEDIUM,
+            category=ErrorCategory.RECOVERABLE,
+            recovery_suggestions=[
+                f"Try with English language instead of '{language}'",
+                "Check if auto-generated captions are available",
+                "Verify the video has any captions enabled",
+                "Try with 'auto' language to get any available transcript"
+            ],
+            context=context
         )
 
 
-class LanguageNotFoundError(TranscriptServiceError):
-    """Raised when requested language is not available"""
-    def __init__(self, video_id: str, language: str, available_languages: List[str]):
+class EnhancedServiceError(EnhancedTranscriptError):
+    """Enhanced service error for external service issues"""
+    def __init__(self, video_id: str, original_error: Exception, context: ErrorContext = None):
+        super().__init__(
+            message=f"Could not retrieve transcript for {video_id}: {str(original_error)}",
+            video_id=video_id,
+            status_code=503,
+            severity=ErrorSeverity.HIGH,
+            category=ErrorCategory.RECOVERABLE,
+            recovery_suggestions=[
+                "Retry the request after a short delay",
+                "Check YouTube service status",
+                "Verify network connectivity",
+                "Try with a different language if applicable"
+            ],
+            context=context,
+            original_error=original_error
+        )
+
+
+# Legacy error classes for backward compatibility
+class TranscriptServiceError(EnhancedTranscriptError):
+    """Legacy transcript service error - now enhanced"""
+    pass
+
+
+class VideoUnavailableError(EnhancedVideoUnavailableError):
+    """Legacy video unavailable error - now enhanced"""
+    pass
+
+
+class TranscriptDisabledError(EnhancedTranscriptDisabledError):
+    """Legacy transcript disabled error - now enhanced"""
+    pass
+
+
+class NoTranscriptFoundError(EnhancedNoTranscriptFoundError):
+    """Legacy no transcript found error - now enhanced"""
+    pass
+
+
+class LanguageNotFoundError(EnhancedTranscriptError):
+    """Legacy language not found error - now enhanced"""
+    def __init__(self, video_id: str, language: str, available_languages: List[str], context: ErrorContext = None):
         available = ", ".join(available_languages) if available_languages else "none"
         super().__init__(
-            f"Language '{language}' not available for video {video_id}. Available: {available}",
+            message=f"Language '{language}' not available for video {video_id}. Available: {available}",
             video_id=video_id,
-            status_code=404
+            status_code=404,
+            severity=ErrorSeverity.MEDIUM,
+            category=ErrorCategory.RECOVERABLE,
+            recovery_suggestions=[
+                f"Try with one of the available languages: {available}" if available_languages else "Check if the video has any transcripts",
+                "Use English ('en') as fallback language",
+                "Request auto-generated transcript if manual not available"
+            ],
+            context=context
         )
 
 
-class RateLimitError(TranscriptServiceError):
-    """Raised when hitting YouTube rate limits"""
-    def __init__(self, video_id: str):
-        super().__init__(
-            f"Rate limit exceeded for video {video_id}. Please try again later.",
-            video_id=video_id,
-            status_code=429
-        )
+class RateLimitError(EnhancedRateLimitError):
+    """Legacy rate limit error - now enhanced"""
+    pass
 
 
 class TranscriptService:
@@ -312,6 +484,119 @@ class TranscriptService:
             self.logger.error(f"❌ Error formatting transcript segments: {e}", exc_info=True)
             raise TranscriptServiceError(f"Failed to format transcript data: {str(e)}")
     
+    def _create_enhanced_error(
+        self,
+        original_error: Exception,
+        video_id: str,
+        language: str = None,
+        context: ErrorContext = None
+    ) -> EnhancedTranscriptError:
+        """
+        Create enhanced error with intelligent categorization and recovery suggestions
+        
+        Args:
+            original_error: The original exception from YouTube API
+            video_id: YouTube video ID
+            language: Requested language (optional)
+            context: Error context (optional)
+            
+        Returns:
+            Enhanced error with categorization and recovery suggestions
+        """
+        if context is None:
+            context = ErrorContext(
+                video_id=video_id,
+                language=language,
+                timestamp=datetime.utcnow().isoformat()
+            )
+        
+        # Map YouTube API errors to enhanced errors
+        if isinstance(original_error, VideoUnavailable):
+            return EnhancedVideoUnavailableError(video_id, context)
+            
+        elif isinstance(original_error, TranscriptsDisabled):
+            return EnhancedTranscriptDisabledError(video_id, context)
+        
+        elif isinstance(original_error, NoTranscriptFound):
+            return EnhancedNoTranscriptFoundError(video_id, language or "unknown", context)
+            
+        elif isinstance(original_error, TooManyRequests):
+            # Try to extract retry-after from error if available
+            retry_after = getattr(original_error, 'retry_after', None)
+            return EnhancedRateLimitError(video_id, retry_after, context)
+            
+        elif isinstance(original_error, CouldNotRetrieveTranscript):
+            return EnhancedServiceError(video_id, original_error, context)
+            
+        elif isinstance(original_error, (NotTranslatable, TranslationLanguageNotAvailable)):
+            return EnhancedTranscriptError(
+                message=f"Translation error for video {video_id}: {str(original_error)}",
+                video_id=video_id,
+                status_code=404,
+                severity=ErrorSeverity.MEDIUM,
+                category=ErrorCategory.RECOVERABLE,
+                recovery_suggestions=[
+                    "Try with the original transcript language",
+                    "Check if manual transcripts are available",
+                    "Use auto-generated transcript if available",
+                    "Verify the target language is supported"
+                ],
+                context=context,
+                original_error=original_error
+            )
+        
+        else:
+            # Generic enhanced error for unknown cases
+            return EnhancedTranscriptError(
+                message=f"Unexpected error: {str(original_error)}",
+                video_id=video_id,
+                status_code=500,
+                severity=ErrorSeverity.HIGH,
+                category=ErrorCategory.EXTERNAL,
+                recovery_suggestions=[
+                    "Retry the request",
+                    "Check service logs for details",
+                    "Contact support if issue persists",
+                    "Verify all dependencies are available"
+                ],
+                context=context,
+                original_error=original_error
+            )
+
+    def _log_enhanced_error(self, error: EnhancedTranscriptError):
+        """Log enhanced error with structured data for monitoring"""
+        log_data = error.to_dict()
+        
+        # Choose log level based on severity
+        if error.severity == ErrorSeverity.CRITICAL:
+            self.logger.critical("Critical transcript service error", extra=log_data)
+        elif error.severity == ErrorSeverity.HIGH:
+            self.logger.error("High severity transcript error", extra=log_data)
+        elif error.severity == ErrorSeverity.MEDIUM:
+            self.logger.warning("Medium severity transcript error", extra=log_data)
+        else:
+            self.logger.info("Low severity transcript error", extra=log_data)
+
+    def _create_error_context(
+        self,
+        video_id: str,
+        language: str = None,
+        attempt_number: int = None,
+        processing_start_time: float = None
+    ) -> ErrorContext:
+        """Create error context with current request information"""
+        context = ErrorContext(
+            video_id=video_id,
+            language=language,
+            attempt_number=attempt_number,
+            timestamp=datetime.utcnow().isoformat()
+        )
+        
+        if processing_start_time:
+            context.processing_duration_ms = (time.time() - processing_start_time) * 1000
+            
+        return context
+
     async def _fetch_transcript_from_youtube(
         self, 
         video_id: str, 
@@ -328,12 +613,10 @@ class TranscriptService:
             List of transcript segments with text and timing information
             
         Raises:
-            VideoUnavailableError: If video doesn't exist
-            TranscriptDisabledError: If transcripts are disabled
-            NoTranscriptFoundError: If no transcript available
-            LanguageNotFoundError: If language not available
-            RateLimitError: If rate limited
+            EnhancedTranscriptError: Enhanced error with detailed context and recovery suggestions
         """
+        start_time = time.time()
+        
         try:
             self.logger.info(f"🎯 Attempting to fetch transcript for video {video_id} in language {language}")
             
@@ -384,7 +667,9 @@ class TranscriptService:
                                     self.logger.info(f"✅ Found auto-generated transcript in {transcript.language_code}")
                                 else:
                                     self.logger.error(f"❌ No transcripts available for video {video_id}")
-                                    raise NoTranscriptFoundError(video_id, language)
+                                    # Create enhanced error context
+                                    context = self._create_error_context(video_id, language, processing_start_time=start_time)
+                                    raise EnhancedNoTranscriptFoundError(video_id, language, context)
             
             # Fetch the actual transcript data
             self.logger.debug(f"Fetching transcript data for {video_id}")
@@ -400,29 +685,19 @@ class TranscriptService:
             
             return raw_transcript
             
-        except VideoUnavailable:
-            self.logger.error(f"❌ Video {video_id} is unavailable")
-            raise VideoUnavailableError(video_id)
+        except EnhancedTranscriptError:
+            # Re-raise enhanced errors as-is
+            raise
             
-        except TranscriptsDisabled:
-            self.logger.error(f"❌ Transcripts are disabled for video {video_id}")
-            raise TranscriptDisabledError(video_id)
+        except Exception as original_error:
+            # Create enhanced error context
+            context = self._create_error_context(video_id, language, processing_start_time=start_time)
             
-        except NoTranscriptFound:
-            self.logger.error(f"❌ No transcript found for video {video_id} in language {language}")
-            raise NoTranscriptFoundError(video_id, language)
+            # Create and log enhanced error
+            enhanced_error = self._create_enhanced_error(original_error, video_id, language, context)
+            self._log_enhanced_error(enhanced_error)
             
-        except TooManyRequests:
-            self.logger.error(f"❌ Rate limit exceeded for video {video_id}")
-            raise RateLimitError(video_id)
-            
-        except Exception as e:
-            self.logger.error(f"❌ Unexpected error fetching transcript for {video_id}: {str(e)}", exc_info=True)
-            raise TranscriptServiceError(
-                f"Failed to fetch transcript: {str(e)}",
-                video_id=video_id,
-                status_code=500
-            )
+            raise enhanced_error
     
     async def _get_languages_from_youtube(self, video_id: str) -> List[LanguageInfo]:
         """
@@ -451,31 +726,6 @@ class TranscriptService:
         """Simulate API response delay for testing"""
         import asyncio
         await asyncio.sleep(0.5)  # 500ms delay to simulate real API
-    
-    def _handle_youtube_api_error(self, error: Exception, video_id: str) -> TranscriptServiceError:
-        """
-        Convert YouTube API errors to our custom exceptions (Phase 2)
-        
-        Args:
-            error: Original YouTube API error
-            video_id: Video ID that caused the error
-            
-        Returns:
-            Appropriate TranscriptServiceError
-        """
-        # TODO: Phase 2 - Implement actual error mapping
-        error_str = str(error).lower()
-        
-        if "unavailable" in error_str or "not found" in error_str:
-            return VideoUnavailableError(video_id)
-        elif "disabled" in error_str:
-            return TranscriptDisabledError(video_id)
-        elif "transcript" not in error_str:
-            return NoTranscriptFoundError(video_id, "unknown")
-        elif "rate" in error_str or "limit" in error_str:
-            return RateLimitError(video_id)
-        else:
-            return TranscriptServiceError(f"YouTube API error: {str(error)}", video_id)
     
     def get_service_stats(self) -> Dict[str, Any]:
         """
