@@ -23,7 +23,7 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
-    TooManyRequests,
+    YouTubeRequestFailed,
     CouldNotRetrieveTranscript,
     NotTranslatable,
     TranslationLanguageNotAvailable
@@ -1035,7 +1035,7 @@ class TranscriptService:
         elif isinstance(original_error, NoTranscriptFound):
             return EnhancedNoTranscriptFoundError(video_id, language or "unknown", context)
             
-        elif isinstance(original_error, TooManyRequests):
+        elif isinstance(original_error, YouTubeRequestFailed):
             # Try to extract retry-after from error if available
             retry_after = getattr(original_error, 'retry_after', None)
             return EnhancedRateLimitError(video_id, retry_after, context)
