@@ -13,6 +13,9 @@ from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass
 import uuid
+import asyncio
+import functools
+import random
 
 # YouTube Transcript API imports
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -264,6 +267,191 @@ class LanguageNotFoundError(EnhancedTranscriptError):
 class RateLimitError(EnhancedRateLimitError):
     """Legacy rate limit error - now enhanced"""
     pass
+
+
+class BackoffStrategy(Enum):
+    """Backoff strategies for retry logic"""
+    EXPONENTIAL = "exponential"    # 1s → 2s → 4s → 8s → 16s
+    LINEAR = "linear"              # 1s → 2s → 3s → 4s → 5s
+    FIXED = "fixed"               # 1s → 1s → 1s → 1s → 1s
+
+
+@dataclass
+class RetryContext:
+    """Context information for retry operations"""
+    attempt_number: int
+    max_attempts: int
+    delay_seconds: float
+    strategy: BackoffStrategy
+    total_elapsed_ms: float
+    function_name: str
+    start_time: float
+    previous_errors: List[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        """Initialize default values"""
+        if self.previous_errors is None:
+            self.previous_errors = []
+
+
+class RetryCalculator:
+    """Calculate retry delays with various backoff strategies"""
+    
+    @staticmethod
+    def calculate_delay(
+        attempt: int,
+        base_delay: float,
+        max_delay: float,
+        strategy: BackoffStrategy = BackoffStrategy.EXPONENTIAL,
+        jitter: bool = True
+    ) -> float:
+        """
+        Calculate delay for specific attempt with strategy and jitter
+        
+        Args:
+            attempt: Current attempt number (1-based)
+            base_delay: Base delay in seconds
+            max_delay: Maximum delay in seconds
+            strategy: Backoff strategy to use
+            jitter: Whether to add randomness to prevent thundering herd
+            
+        Returns:
+            Calculated delay in seconds
+        """
+        if strategy == BackoffStrategy.EXPONENTIAL:
+            # Exponential: base * 2^(attempt-1)
+            delay = base_delay * (2 ** (attempt - 1))
+        elif strategy == BackoffStrategy.LINEAR:
+            # Linear: base * attempt
+            delay = base_delay * attempt
+        elif strategy == BackoffStrategy.FIXED:
+            # Fixed: always base delay
+            delay = base_delay
+        else:
+            # Default to exponential
+            delay = base_delay * (2 ** (attempt - 1))
+        
+        # Apply maximum delay limit
+        delay = min(delay, max_delay)
+        
+        # Add jitter to prevent thundering herd (±25% randomness)
+        if jitter:
+            jitter_amount = delay * 0.25
+            delay = delay + random.uniform(-jitter_amount, jitter_amount)
+            delay = max(0.1, delay)  # Minimum 100ms delay
+        
+        return round(delay, 3)
+    
+    @staticmethod
+    def calculate_total_max_delay(
+        max_attempts: int,
+        base_delay: float,
+        max_delay: float,
+        strategy: BackoffStrategy = BackoffStrategy.EXPONENTIAL
+    ) -> float:
+        """Calculate total maximum delay for all retry attempts"""
+        total_delay = 0.0
+        for attempt in range(1, max_attempts):  # Don't include last attempt
+            delay = RetryCalculator.calculate_delay(
+                attempt, base_delay, max_delay, strategy, jitter=False
+            )
+            total_delay += delay
+        return total_delay
+
+
+def retry_with_backoff(
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    strategy: BackoffStrategy = BackoffStrategy.EXPONENTIAL,
+    jitter: bool = True
+):
+    """
+    Decorator for retrying failed operations with configurable backoff
+    
+    Args:
+        max_attempts: Maximum number of retry attempts (default: 3)
+        base_delay: Base delay in seconds (default: 1.0)
+        max_delay: Maximum delay in seconds (default: 60.0)
+        strategy: Backoff strategy for calculating delays
+        jitter: Add randomness to prevent thundering herd (default: True)
+        
+    Returns:
+        Decorated function with retry logic
+        
+    Example:
+        @retry_with_backoff(max_attempts=3, base_delay=1.0)
+        async def fetch_data():
+            # Function that might fail and need retry
+            pass
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            start_time = time.time()
+            last_exception = None
+            
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    # Log attempt (except for first attempt)
+                    if attempt > 1:
+                        logger.debug(
+                            f"🔄 Retry attempt {attempt}/{max_attempts} for {func.__name__}"
+                        )
+                    
+                    # Execute the function
+                    result = await func(*args, **kwargs)
+                    
+                    # Log successful retry if not first attempt
+                    if attempt > 1:
+                        elapsed_time = (time.time() - start_time) * 1000
+                        logger.info(
+                            f"✅ Retry successful for {func.__name__} on attempt {attempt}/{max_attempts} "
+                            f"after {elapsed_time:.2f}ms"
+                        )
+                    
+                    return result
+                    
+                except Exception as e:
+                    last_exception = e
+                    
+                    # Log the error for this attempt
+                    logger.debug(
+                        f"❌ Attempt {attempt}/{max_attempts} failed for {func.__name__}: {str(e)}"
+                    )
+                    
+                    # Don't wait after the last attempt
+                    if attempt >= max_attempts:
+                        break
+                    
+                    # Calculate delay for next attempt
+                    delay = RetryCalculator.calculate_delay(
+                        attempt, base_delay, max_delay, strategy, jitter
+                    )
+                    
+                    # Log retry delay
+                    logger.warning(
+                        f"🔄 Retrying {func.__name__} in {delay:.2f}s "
+                        f"(attempt {attempt + 1}/{max_attempts}, strategy: {strategy.value})"
+                    )
+                    
+                    # Wait before next retry
+                    await asyncio.sleep(delay)
+            
+            # All attempts failed
+            total_elapsed = (time.time() - start_time) * 1000
+            logger.error(
+                f"❌ All retry attempts failed for {func.__name__} after {total_elapsed:.2f}ms"
+            )
+            
+            # Re-raise the last exception
+            if last_exception:
+                raise last_exception
+            else:
+                raise Exception(f"All {max_attempts} retry attempts failed")
+        
+        return wrapper
+    return decorator
 
 
 class TranscriptService:
@@ -597,6 +785,121 @@ class TranscriptService:
             
         return context
 
+    async def _execute_with_retry(
+        self,
+        func,
+        *args,
+        max_attempts: int = 3,
+        base_delay: float = 1.0,
+        max_delay: float = 30.0,
+        strategy: BackoffStrategy = BackoffStrategy.EXPONENTIAL,
+        **kwargs
+    ):
+        """
+        Execute function with retry logic and basic error handling
+        
+        Args:
+            func: Function to execute with retry
+            *args: Arguments to pass to the function
+            max_attempts: Maximum number of attempts (default: 3)
+            base_delay: Base delay in seconds (default: 1.0)
+            max_delay: Maximum delay in seconds (default: 30.0)
+            strategy: Backoff strategy to use
+            **kwargs: Keyword arguments to pass to the function
+            
+        Returns:
+            Result from successful function execution
+            
+        Raises:
+            Last exception if all retry attempts fail
+        """
+        start_time = time.time()
+        last_exception = None
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Log attempt info
+                if attempt > 1:
+                    self.logger.debug(
+                        f"🔄 Retry attempt {attempt}/{max_attempts} for {func.__name__}"
+                    )
+                
+                # Execute the function
+                result = await func(*args, **kwargs)
+                
+                # Log successful retry if not first attempt
+                if attempt > 1:
+                    elapsed_time = (time.time() - start_time) * 1000
+                    self.logger.info(
+                        f"✅ Retry successful for {func.__name__} on attempt {attempt}/{max_attempts} "
+                        f"after {elapsed_time:.2f}ms",
+                        extra={
+                            "event": "retry_success",
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "elapsed_ms": elapsed_time,
+                            "function": func.__name__
+                        }
+                    )
+                
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                
+                # Log the error for this attempt
+                self.logger.debug(
+                    f"❌ Attempt {attempt}/{max_attempts} failed for {func.__name__}: {str(e)}"
+                )
+                
+                # Don't wait after the last attempt
+                if attempt >= max_attempts:
+                    break
+                
+                # Calculate delay for next attempt
+                delay = RetryCalculator.calculate_delay(
+                    attempt, base_delay, max_delay, strategy, jitter=True
+                )
+                
+                # Log retry attempt with structured data
+                self.logger.warning(
+                    f"🔄 Retrying {func.__name__} in {delay:.2f}s "
+                    f"(attempt {attempt + 1}/{max_attempts})",
+                    extra={
+                        "event": "retry_attempt",
+                        "function": func.__name__,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "delay_seconds": delay,
+                        "strategy": strategy.value,
+                        "error": str(e),
+                        "error_type": type(e).__name__
+                    }
+                )
+                
+                # Wait before next retry
+                await asyncio.sleep(delay)
+        
+        # All attempts failed - log final failure
+        total_elapsed = (time.time() - start_time) * 1000
+        self.logger.error(
+            f"❌ All retry attempts failed for {func.__name__} after {total_elapsed:.2f}ms",
+            extra={
+                "event": "retry_failure",
+                "function": func.__name__,
+                "total_attempts": max_attempts,
+                "total_elapsed_ms": total_elapsed,
+                "final_error": str(last_exception),
+                "final_error_type": type(last_exception).__name__ if last_exception else "Unknown"
+            }
+        )
+        
+        # Re-raise the last exception
+        if last_exception:
+            raise last_exception
+        else:
+            raise Exception(f"All {max_attempts} retry attempts failed for {func.__name__}")
+
     async def _fetch_transcript_from_youtube(
         self, 
         video_id: str, 
@@ -724,7 +1027,6 @@ class TranscriptService:
     
     async def _simulate_api_delay(self):
         """Simulate API response delay for testing"""
-        import asyncio
         await asyncio.sleep(0.5)  # 500ms delay to simulate real API
     
     def get_service_stats(self) -> Dict[str, Any]:
