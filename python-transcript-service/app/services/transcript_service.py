@@ -131,7 +131,7 @@ class TranscriptService:
         Args:
             video_id: YouTube video ID
             language: Language code for transcript (default: 'en')
-            format_type: Output format ('json', 'text', 'srt', 'vtt')
+            format_type: Output format ('json', 'text', 'srt', 'vtt', 'fts')
             
         Returns:
             TranscriptResponse with transcript data
@@ -146,39 +146,85 @@ class TranscriptService:
         start_time = time.time()
         
         try:
-            self.logger.info(f"🎯 Fetching transcript for video: {video_id}, language: {language}")
+            self.logger.info(f"🎯 Fetching transcript for video: {video_id}, language: {language}, format: {format_type}")
+            
+            # Validate format type
+            valid_formats = {"json", "text", "srt", "vtt", "fts"}
+            if format_type not in valid_formats:
+                raise TranscriptServiceError(
+                    f"Invalid format '{format_type}'. Supported formats: {', '.join(valid_formats)}",
+                    video_id=video_id,
+                    status_code=400
+                )
             
             # Validate and sanitize video ID
             clean_video_id = sanitize_video_id(video_id)
             if not clean_video_id:
                 raise VideoUnavailableError(video_id)
             
-            # TODO: Phase 2 - Implement actual transcript fetching
-            # For now, return a placeholder response to test the structure
+            # Fetch transcript segments from YouTube
             transcript_segments = await self._fetch_transcript_from_youtube(
                 clean_video_id, language
             )
             
-            # Format the response
+            # Format the transcript segments
             formatted_transcript = self._format_transcript_segments(transcript_segments)
             
+            # Apply format conversion based on requested format
+            if format_type == "text":
+                formatted_content = self._convert_to_text_format(formatted_transcript)
+                content_type = "text/plain"
+            elif format_type == "srt":
+                formatted_content = self._convert_to_srt_format(formatted_transcript)
+                content_type = "application/x-subrip"
+            elif format_type == "vtt":
+                formatted_content = self._convert_to_vtt_format(formatted_transcript)
+                content_type = "text/vtt"
+            elif format_type == "fts":
+                formatted_content = self._convert_to_fts_format(formatted_transcript)
+                content_type = "application/json"
+            else:  # json format (default)
+                formatted_content = formatted_transcript
+                content_type = "application/json"
+            
             processing_time = (time.time() - start_time) * 1000  # Convert to ms
+            
+            # Prepare metadata
+            metadata = {
+                "fetched_at": datetime.utcnow().isoformat(),
+                "source": "youtube-transcript-api",
+                "format": format_type,
+                "content_type": content_type,
+                "processing_time_ms": round(processing_time, 2)
+            }
+            
+            # Add format-specific metadata
+            if isinstance(formatted_content, list):
+                metadata["segment_count"] = len(formatted_content)
+                if formatted_content:
+                    metadata["total_duration_seconds"] = round(
+                        formatted_content[-1].get("end_seconds", 0) if format_type == "fts" 
+                        else formatted_content[-1].start + formatted_content[-1].duration, 2
+                    )
+            elif isinstance(formatted_content, str):
+                metadata["content_length"] = len(formatted_content)
+                metadata["line_count"] = formatted_content.count('\n') + 1
             
             response = TranscriptResponse(
                 success=True,
                 video_id=clean_video_id,
                 language=language,
                 format=format_type,
-                transcript=formatted_transcript,
-                metadata={
-                    "fetched_at": datetime.utcnow().isoformat(),
-                    "source": "youtube-transcript-api",
-                    "format": format_type
-                },
+                transcript=formatted_content,
+                metadata=metadata,
                 processing_time_ms=processing_time
             )
             
-            self.logger.info(f"✅ Successfully fetched transcript for {clean_video_id} ({len(formatted_transcript)} segments)")
+            self.logger.info(
+                f"✅ Successfully processed transcript for {clean_video_id} "
+                f"(format: {format_type}, segments: {metadata.get('segment_count', 'N/A')}, "
+                f"time: {processing_time:.2f}ms)"
+            )
             return response
             
         except TranscriptServiceError:
@@ -455,4 +501,118 @@ class TranscriptService:
                 "Error handling",
                 "Rate limiting"
             ]
-        } 
+        }
+
+    def _convert_to_text_format(self, segments: List[TranscriptSegment]) -> str:
+        """Convert transcript segments to plain text"""
+        return "\n".join([segment.text.strip() for segment in segments if segment.text.strip()])
+
+    def _convert_to_srt_format(self, segments: List[TranscriptSegment]) -> str:
+        """Convert transcript segments to SRT format"""
+        srt_content = []
+        for i, segment in enumerate(segments, 1):
+            if not segment.text.strip():
+                continue
+                
+            start_time = self._format_srt_timestamp(segment.start)
+            end_time = self._format_srt_timestamp(segment.start + segment.duration)
+            
+            srt_content.extend([
+                str(i),
+                f"{start_time} --> {end_time}",
+                segment.text.strip(),
+                ""
+            ])
+        
+        return "\n".join(srt_content)
+
+    def _convert_to_vtt_format(self, segments: List[TranscriptSegment]) -> str:
+        """Convert transcript segments to WebVTT format"""
+        vtt_content = ["WEBVTT\n"]
+        
+        for segment in segments:
+            if not segment.text.strip():
+                continue
+                
+            start_time = self._format_vtt_timestamp(segment.start)
+            end_time = self._format_vtt_timestamp(segment.start + segment.duration)
+            
+            vtt_content.extend([
+                f"{start_time} --> {end_time}",
+                segment.text.strip(),
+                ""
+            ])
+        
+        return "\n".join(vtt_content)
+
+    def _convert_to_fts_format(self, segments: List[TranscriptSegment]) -> List[Dict[str, Any]]:
+        """
+        Convert to FTS-optimized structured format for database ingestion and temporal search
+        
+        Returns:
+            List of structured segments optimized for FTS indexing with temporal metadata
+        """
+        fts_segments = []
+        
+        for i, segment in enumerate(segments):
+            if not segment.text.strip():
+                continue
+                
+            fts_segment = {
+                "segment_id": i,
+                "text": segment.text.strip(),
+                "start_seconds": round(segment.start, 3),
+                "end_seconds": round(segment.start + segment.duration, 3),
+                "duration_seconds": round(segment.duration, 3),
+                "start_timestamp": self._format_readable_timestamp(segment.start),
+                "end_timestamp": self._format_readable_timestamp(segment.start + segment.duration),
+                "word_count": len(segment.text.split()),
+                "char_count": len(segment.text),
+                "text_hash": hash(segment.text.strip()),  # For deduplication
+                "temporal_context": {
+                    "is_intro": segment.start < 120,  # First 2 minutes
+                    "is_outro": False,  # Will be calculated after we know total duration
+                    "relative_position": 0.0  # Will be calculated after we know total duration
+                }
+            }
+            fts_segments.append(fts_segment)
+        
+        # Calculate relative positions and outro detection
+        if fts_segments:
+            total_duration = fts_segments[-1]["end_seconds"]
+            outro_threshold = max(total_duration - 120, total_duration * 0.9)  # Last 2 min or 10%
+            
+            for segment in fts_segments:
+                segment["temporal_context"]["relative_position"] = round(
+                    segment["start_seconds"] / total_duration, 3
+                ) if total_duration > 0 else 0.0
+                segment["temporal_context"]["is_outro"] = segment["start_seconds"] >= outro_threshold
+        
+        return fts_segments
+
+    def _format_srt_timestamp(self, seconds: float) -> str:
+        """Format timestamp for SRT format (HH:MM:SS,mmm)"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millisecs = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
+
+    def _format_vtt_timestamp(self, seconds: float) -> str:
+        """Format timestamp for VTT format (HH:MM:SS.mmm)"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millisecs = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millisecs:03d}"
+
+    def _format_readable_timestamp(self, seconds: float) -> str:
+        """Format timestamp in human-readable format (MM:SS or HH:MM:SS)"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}" 
