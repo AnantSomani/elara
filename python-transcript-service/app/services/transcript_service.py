@@ -585,13 +585,227 @@ class TranscriptService:
             self.logger.error(f"❌ Failed to import YouTube Transcript API: {e}")
             raise
         
+        # Basic service configuration
         self.request_timeout = int(os.getenv("TRANSCRIPT_FETCH_TIMEOUT", 60))
         self.rate_limit_requests = int(os.getenv("RATE_LIMIT_REQUESTS", 100))
         self.rate_limit_window = int(os.getenv("RATE_LIMIT_WINDOW", 60))
         
+        # Advanced retry configuration from environment
+        self.retry_max_attempts = int(os.getenv("RETRY_MAX_ATTEMPTS", 3))
+        self.retry_base_delay = float(os.getenv("RETRY_BASE_DELAY", 1.0))
+        self.retry_max_delay = float(os.getenv("RETRY_MAX_DELAY", 60.0))
+        self.retry_enable_jitter = os.getenv("RETRY_ENABLE_JITTER", "true").lower() == "true"
+        
+        # Rate limiting specific configuration
+        self.rate_limit_retry_multiplier = float(os.getenv("RATE_LIMIT_RETRY_MULTIPLIER", 1.5))
+        self.rate_limit_max_backoff = float(os.getenv("RATE_LIMIT_MAX_BACKOFF", 300.0))
+        self.rate_limit_respect_headers = os.getenv("RATE_LIMIT_RESPECT_HEADERS", "true").lower() == "true"
+        
+        # Retry metrics tracking
+        self.retry_metrics = {
+            "total_attempts": 0,
+            "successful_retries": 0,
+            "failed_retries": 0,
+            "rate_limit_retries": 0,
+            "non_recoverable_failures": 0,
+            "average_retry_delay": 0.0,
+            "last_reset_time": datetime.utcnow()
+        }
+        
         self.logger.info("🚀 TranscriptService initialized")
-        self.logger.debug(f"Configuration: timeout={self.request_timeout}s, rate_limit={self.rate_limit_requests}/min")
+        self.logger.debug(
+            f"Configuration: timeout={self.request_timeout}s, "
+            f"rate_limit={self.rate_limit_requests}/min, "
+            f"retry_config=(max_attempts={self.retry_max_attempts}, "
+            f"base_delay={self.retry_base_delay}s, max_delay={self.retry_max_delay}s, "
+            f"jitter={self.retry_enable_jitter})"
+        )
     
+    def _calculate_rate_limit_delay(
+        self,
+        error: Exception,
+        attempt: int,
+        base_delay: float
+    ) -> float:
+        """
+        Calculate intelligent delay for rate-limited requests
+        
+        Args:
+            error: Rate limit error (may contain retry-after info)
+            attempt: Current attempt number
+            base_delay: Base delay for exponential backoff
+            
+        Returns:
+            Calculated delay in seconds with rate-limit awareness
+        """
+        retry_after = None
+        
+        # Try to extract retry-after from enhanced error
+        if isinstance(error, EnhancedRateLimitError) and hasattr(error, 'retry_after'):
+            retry_after = error.retry_after
+        
+        # Try to extract from error string (fallback)
+        if retry_after is None:
+            error_str = str(error).lower()
+            if 'retry after' in error_str:
+                try:
+                    # Look for patterns like "retry after 60 seconds"
+                    import re
+                    match = re.search(r'retry after (\d+)', error_str)
+                    if match:
+                        retry_after = int(match.group(1))
+                except:
+                    pass
+        
+        if retry_after and self.rate_limit_respect_headers:
+            # Use API-provided retry-after with multiplier and jitter
+            delay = retry_after * self.rate_limit_retry_multiplier
+            
+            if self.retry_enable_jitter:
+                # Add small jitter (±10% for rate limits)
+                jitter_amount = delay * 0.1
+                delay = delay + random.uniform(-jitter_amount, jitter_amount)
+                delay = max(1.0, delay)  # Minimum 1 second
+            
+            # Apply maximum backoff limit
+            delay = min(delay, self.rate_limit_max_backoff)
+            
+            self.logger.debug(
+                f"🚦 Rate limit delay calculated from header: {retry_after}s → {delay:.2f}s "
+                f"(multiplier={self.rate_limit_retry_multiplier}, jitter={self.retry_enable_jitter})"
+            )
+            
+        else:
+            # Fallback to exponential backoff with rate-limit specific settings
+            delay = RetryCalculator.calculate_delay(
+                attempt, 
+                max(base_delay, 5.0),  # Minimum 5s for rate limits
+                self.rate_limit_max_backoff,
+                BackoffStrategy.EXPONENTIAL,
+                self.retry_enable_jitter
+            )
+            
+            self.logger.debug(
+                f"🚦 Rate limit delay calculated via exponential backoff: {delay:.2f}s "
+                f"(no retry-after header available)"
+            )
+        
+        return delay
+
+    def _update_retry_metrics(
+        self,
+        event_type: str,
+        error: Exception = None,
+        delay: float = None,
+        success: bool = False
+    ):
+        """
+        Update retry metrics for monitoring and observability
+        
+        Args:
+            event_type: Type of retry event
+            error: Error that occurred (optional)
+            delay: Delay used for retry (optional)
+            success: Whether the retry was successful
+        """
+        self.retry_metrics["total_attempts"] += 1
+        
+        if event_type == "retry_success" and success:
+            self.retry_metrics["successful_retries"] += 1
+        elif event_type == "retry_failure":
+            self.retry_metrics["failed_retries"] += 1
+        elif event_type == "rate_limit":
+            self.retry_metrics["rate_limit_retries"] += 1
+        elif event_type == "non_recoverable":
+            self.retry_metrics["non_recoverable_failures"] += 1
+        
+        # Update average delay
+        if delay is not None:
+            current_avg = self.retry_metrics["average_retry_delay"]
+            total_attempts = self.retry_metrics["total_attempts"]
+            self.retry_metrics["average_retry_delay"] = (
+                (current_avg * (total_attempts - 1) + delay) / total_attempts
+            )
+
+    def get_retry_metrics(self) -> Dict[str, Any]:
+        """
+        Get current retry metrics for monitoring
+        
+        Returns:
+            Dictionary with retry statistics and performance metrics
+        """
+        current_time = datetime.utcnow()
+        uptime_hours = (current_time - self.retry_metrics["last_reset_time"]).total_seconds() / 3600
+        
+        total_attempts = self.retry_metrics["total_attempts"]
+        success_rate = (
+            (self.retry_metrics["successful_retries"] / total_attempts * 100) 
+            if total_attempts > 0 else 0.0
+        )
+        
+        return {
+            "retry_statistics": {
+                "total_attempts": total_attempts,
+                "successful_retries": self.retry_metrics["successful_retries"],
+                "failed_retries": self.retry_metrics["failed_retries"],
+                "rate_limit_retries": self.retry_metrics["rate_limit_retries"],
+                "non_recoverable_failures": self.retry_metrics["non_recoverable_failures"],
+                "success_rate_percent": round(success_rate, 2)
+            },
+            "performance_metrics": {
+                "average_retry_delay_seconds": round(self.retry_metrics["average_retry_delay"], 2),
+                "uptime_hours": round(uptime_hours, 2),
+                "attempts_per_hour": round(total_attempts / max(uptime_hours, 0.1), 2)
+            },
+            "configuration": {
+                "max_attempts": self.retry_max_attempts,
+                "base_delay": self.retry_base_delay,
+                "max_delay": self.retry_max_delay,
+                "rate_limit_max_backoff": self.rate_limit_max_backoff,
+                "jitter_enabled": self.retry_enable_jitter,
+                "respect_rate_limit_headers": self.rate_limit_respect_headers
+            },
+            "last_reset": self.retry_metrics["last_reset_time"].isoformat()
+        }
+
+    def reset_retry_metrics(self):
+        """Reset retry metrics (useful for monitoring resets)"""
+        old_metrics = self.retry_metrics.copy()
+        self.retry_metrics = {
+            "total_attempts": 0,
+            "successful_retries": 0,
+            "failed_retries": 0,
+            "rate_limit_retries": 0,
+            "non_recoverable_failures": 0,
+            "average_retry_delay": 0.0,
+            "last_reset_time": datetime.utcnow()
+        }
+        
+        self.logger.info(
+            "📊 Retry metrics reset",
+            extra={
+                "event": "metrics_reset",
+                "previous_metrics": old_metrics,
+                "reset_time": datetime.utcnow().isoformat()
+            }
+        )
+
+    def _log_retry_metrics_summary(self, retry_context: EnhancedRetryContext):
+        """Log retry metrics summary for monitoring"""
+        metrics = self.get_retry_metrics()
+        
+        self.logger.info(
+            f"📊 Retry metrics summary - Success rate: {metrics['retry_statistics']['success_rate_percent']}%",
+            extra={
+                "event": "retry_metrics_summary",
+                "video_id": retry_context.video_id,
+                "function": retry_context.function_name,
+                "current_session_attempts": retry_context.attempt_number,
+                "metrics": metrics['retry_statistics'],
+                "performance": metrics['performance_metrics']
+            }
+        )
+
     async def fetch_transcript(
         self, 
         video_id: str, 
@@ -902,21 +1116,21 @@ class TranscriptService:
         self,
         func,
         *args,
-        max_attempts: int = 3,
-        base_delay: float = 1.0,
-        max_delay: float = 30.0,
+        max_attempts: int = None,
+        base_delay: float = None,
+        max_delay: float = None,
         strategy: BackoffStrategy = BackoffStrategy.EXPONENTIAL,
         **kwargs
     ):
         """
-        Execute function with intelligent retry logic and enhanced error handling
+        Execute function with intelligent retry logic and advanced features
         
         Args:
             func: Function to execute with retry
             *args: Arguments to pass to the function
-            max_attempts: Maximum number of attempts (default: 3)
-            base_delay: Base delay in seconds (default: 1.0)
-            max_delay: Maximum delay in seconds (default: 30.0)
+            max_attempts: Maximum number of attempts (default: from config)
+            base_delay: Base delay in seconds (default: from config)
+            max_delay: Maximum delay in seconds (default: from config)
             strategy: Backoff strategy to use (can be overridden by error type)
             **kwargs: Keyword arguments to pass to the function
             
@@ -926,6 +1140,11 @@ class TranscriptService:
         Raises:
             Last exception if all retry attempts fail
         """
+        # Use configuration defaults if not specified
+        max_attempts = max_attempts or self.retry_max_attempts
+        base_delay = base_delay or self.retry_base_delay
+        max_delay = max_delay or self.retry_max_delay
+        
         start_time = time.time()
         
         # Create enhanced retry context
@@ -953,36 +1172,44 @@ class TranscriptService:
                 # Log attempt info (except for first attempt)
                 if attempt > 1:
                     self.logger.debug(
-                        f"🔄 Smart retry attempt {attempt}/{max_attempts} for {func.__name__}",
+                        f"🔄 Advanced retry attempt {attempt}/{max_attempts} for {func.__name__}",
                         extra={
-                            "event": "smart_retry_attempt",
+                            "event": "advanced_retry_attempt",
                             "function": func.__name__,
                             "attempt": attempt,
                             "max_attempts": max_attempts,
                             "video_id": retry_context.video_id,
-                            "error_history_count": len(retry_context.error_history)
+                            "error_history_count": len(retry_context.error_history),
+                            "total_service_attempts": self.retry_metrics["total_attempts"]
                         }
                     )
                 
                 # Execute the function
                 result = await func(*args, **kwargs)
                 
-                # Log successful retry if not first attempt
+                # Update metrics for successful retry
                 if attempt > 1:
+                    self._update_retry_metrics("retry_success", success=True)
                     elapsed_time = (time.time() - start_time) * 1000
+                    
                     self.logger.info(
-                        f"✅ Smart retry successful for {func.__name__} on attempt {attempt}/{max_attempts} "
+                        f"✅ Advanced retry successful for {func.__name__} on attempt {attempt}/{max_attempts} "
                         f"after {elapsed_time:.2f}ms",
                         extra={
-                            "event": "smart_retry_success",
+                            "event": "advanced_retry_success",
                             "attempt": attempt,
                             "max_attempts": max_attempts,
                             "elapsed_ms": elapsed_time,
                             "function": func.__name__,
                             "video_id": retry_context.video_id,
-                            "error_history": retry_context.error_history
+                            "error_history": retry_context.error_history,
+                            "total_service_retries": self.retry_metrics["successful_retries"]
                         }
                     )
+                    
+                    # Log metrics summary periodically
+                    if self.retry_metrics["total_attempts"] % 10 == 0:
+                        self._log_retry_metrics_summary(retry_context)
                 
                 return result
                 
@@ -999,16 +1226,29 @@ class TranscriptService:
                 # Use smart retry decision logic
                 should_retry = should_retry_error(e, attempt, max_attempts)
                 
-                # Log the error for this attempt with smart context
+                # Update metrics based on error type
+                if isinstance(e, EnhancedTranscriptError):
+                    if e.category == ErrorCategory.RATE_LIMITED:
+                        self._update_retry_metrics("rate_limit", error=e)
+                    elif e.category == ErrorCategory.NON_RECOVERABLE:
+                        self._update_retry_metrics("non_recoverable", error=e)
+                
+                # Log the error for this attempt with advanced context
                 log_extra = {
-                    "event": "smart_retry_attempt_failed",
+                    "event": "advanced_retry_attempt_failed",
                     "function": func.__name__,
                     "attempt": attempt,
                     "max_attempts": max_attempts,
                     "error": str(e),
                     "error_type": type(e).__name__,
                     "should_retry": should_retry,
-                    "video_id": retry_context.video_id
+                    "video_id": retry_context.video_id,
+                    "service_metrics": {
+                        "total_attempts": self.retry_metrics["total_attempts"],
+                        "success_rate": round(
+                            (self.retry_metrics["successful_retries"] / max(self.retry_metrics["total_attempts"], 1)) * 100, 2
+                        )
+                    }
                 }
                 
                 # Add enhanced error context if available
@@ -1034,20 +1274,27 @@ class TranscriptService:
                 if attempt >= max_attempts:
                     break
                 
-                # Get appropriate strategy for this error type
-                error_strategy = get_retry_strategy_for_error(e)
+                # Calculate delay based on error type
+                if isinstance(e, EnhancedTranscriptError) and e.category == ErrorCategory.RATE_LIMITED:
+                    # Use advanced rate-limit aware delay calculation
+                    delay = self._calculate_rate_limit_delay(e, attempt, base_delay)
+                    error_strategy = BackoffStrategy.EXPONENTIAL
+                else:
+                    # Get appropriate strategy for this error type
+                    error_strategy = get_retry_strategy_for_error(e)
+                    
+                    # Calculate delay for next attempt
+                    delay = RetryCalculator.calculate_delay(
+                        attempt, base_delay, max_delay, error_strategy, jitter=self.retry_enable_jitter
+                    )
                 
-                # Calculate delay for next attempt
-                delay = RetryCalculator.calculate_delay(
-                    attempt, base_delay, max_delay, error_strategy, jitter=True
-                )
-                
-                # Update retry context
+                # Update retry context and metrics
                 retry_context.delay_seconds = delay
                 retry_context.strategy = error_strategy
+                self._update_retry_metrics("retry_attempt", error=e, delay=delay)
                 
-                # Log smart retry attempt with enhanced context
-                self._log_smart_retry_attempt(e, attempt, max_attempts, delay, error_strategy, retry_context)
+                # Log advanced retry attempt with enhanced context
+                self._log_advanced_retry_attempt(e, attempt, max_attempts, delay, error_strategy, retry_context)
                 
                 # Wait before next retry
                 await asyncio.sleep(delay)
@@ -1056,15 +1303,18 @@ class TranscriptService:
         total_elapsed = (time.time() - start_time) * 1000
         retry_context.total_elapsed_ms = total_elapsed
         
-        self._log_smart_retry_failure(last_exception, max_attempts, retry_context)
+        # Update final failure metrics
+        self._update_retry_metrics("retry_failure", error=last_exception)
+        
+        self._log_advanced_retry_failure(last_exception, max_attempts, retry_context)
         
         # Re-raise the last exception
         if last_exception:
             raise last_exception
         else:
-            raise Exception(f"All {max_attempts} smart retry attempts failed for {func.__name__}")
+            raise Exception(f"All {max_attempts} advanced retry attempts failed for {func.__name__}")
 
-    def _log_smart_retry_attempt(
+    def _log_advanced_retry_attempt(
         self,
         error: Exception,
         attempt: int,
@@ -1073,9 +1323,9 @@ class TranscriptService:
         strategy: BackoffStrategy,
         retry_context: EnhancedRetryContext
     ):
-        """Log smart retry attempt with enhanced context"""
+        """Log advanced retry attempt with comprehensive context"""
         log_data = {
-            "event": "smart_retry_scheduled",
+            "event": "advanced_retry_scheduled",
             "function": retry_context.function_name,
             "video_id": retry_context.video_id,
             "language": retry_context.language,
@@ -1085,7 +1335,17 @@ class TranscriptService:
             "strategy": strategy.value,
             "error_type": type(error).__name__,
             "total_elapsed_ms": retry_context.total_elapsed_ms,
-            "error_history_count": len(retry_context.error_history)
+            "error_history_count": len(retry_context.error_history),
+            "service_metrics": {
+                "total_service_attempts": self.retry_metrics["total_attempts"],
+                "rate_limit_retries": self.retry_metrics["rate_limit_retries"],
+                "average_delay": round(self.retry_metrics["average_retry_delay"], 2)
+            },
+            "configuration": {
+                "jitter_enabled": self.retry_enable_jitter,
+                "respect_rate_limits": self.rate_limit_respect_headers,
+                "rate_limit_multiplier": self.rate_limit_retry_multiplier
+            }
         }
         
         # Add enhanced error details if available
@@ -1096,56 +1356,32 @@ class TranscriptService:
                 "recoverable": error.is_recoverable(),
                 "retry_strategy_reason": f"Category: {error.category.value}, Severity: {error.severity.value}"
             })
+            
+            # Add rate limit specific info
+            if error.category == ErrorCategory.RATE_LIMITED and hasattr(error, 'retry_after'):
+                log_data["rate_limit_info"] = {
+                    "retry_after_header": error.retry_after,
+                    "calculated_delay": delay,
+                    "uses_header": self.rate_limit_respect_headers
+                }
         
         self.logger.warning(
-            f"🔄 Smart retry scheduled for {retry_context.function_name} in {delay:.2f}s "
+            f"🔄 Advanced retry scheduled for {retry_context.function_name} in {delay:.2f}s "
             f"(attempt {attempt + 1}/{max_attempts}, strategy: {strategy.value})",
             extra=log_data
         )
 
-    def _log_smart_retry_decision(
-        self,
-        error: Exception,
-        attempt: int,
-        max_attempts: int,
-        decision: str,
-        retry_context: EnhancedRetryContext
-    ):
-        """Log smart retry decision with reasoning"""
-        log_data = {
-            "event": "smart_retry_decision",
-            "function": retry_context.function_name,
-            "video_id": retry_context.video_id,
-            "attempt": attempt,
-            "max_attempts": max_attempts,
-            "decision": decision,
-            "error_type": type(error).__name__,
-            "error_history": retry_context.error_history
-        }
-        
-        # Add reasoning for enhanced errors
-        if isinstance(error, EnhancedTranscriptError):
-            log_data.update({
-                "error_category": error.category.value,
-                "error_severity": error.severity.value,
-                "decision_reason": f"Category {error.category.value} is {'recoverable' if error.is_recoverable() else 'not recoverable'}"
-            })
-        
-        level = "info" if decision == "will_not_retry" else "warning"
-        getattr(self.logger, level)(
-            f"🧠 Smart retry decision: {decision} for {retry_context.function_name}",
-            extra=log_data
-        )
-
-    def _log_smart_retry_failure(
+    def _log_advanced_retry_failure(
         self,
         final_error: Exception,
         max_attempts: int,
         retry_context: EnhancedRetryContext
     ):
-        """Log final smart retry failure with complete context"""
+        """Log final advanced retry failure with comprehensive context"""
+        final_metrics = self.get_retry_metrics()
+        
         log_data = {
-            "event": "smart_retry_final_failure",
+            "event": "advanced_retry_final_failure",
             "function": retry_context.function_name,
             "video_id": retry_context.video_id,
             "language": retry_context.language,
@@ -1153,7 +1389,8 @@ class TranscriptService:
             "total_elapsed_ms": retry_context.total_elapsed_ms,
             "error_history": retry_context.error_history,
             "final_error_type": type(final_error).__name__ if final_error else "Unknown",
-            "final_error_message": str(final_error) if final_error else "Unknown"
+            "final_error_message": str(final_error) if final_error else "Unknown",
+            "service_metrics": final_metrics
         }
         
         # Add enhanced error details if available
@@ -1165,7 +1402,7 @@ class TranscriptService:
             })
         
         self.logger.error(
-            f"❌ All smart retry attempts failed for {retry_context.function_name} "
+            f"❌ All advanced retry attempts failed for {retry_context.function_name} "
             f"after {retry_context.total_elapsed_ms:.2f}ms",
             extra=log_data
         )
@@ -1276,17 +1513,17 @@ class TranscriptService:
         self, 
         video_id: str, 
         language: str,
-        max_attempts: int = 3,
-        base_delay: float = 1.0
+        max_attempts: int = None,
+        base_delay: float = None
     ) -> List[Dict[str, Any]]:
         """
-        Fetch transcript from YouTube with intelligent retry logic
+        Fetch transcript from YouTube with intelligent retry logic and advanced features
         
         Args:
             video_id: YouTube video ID
             language: Requested language code
-            max_attempts: Maximum retry attempts (default: 3)
-            base_delay: Base delay between retries (default: 1.0s)
+            max_attempts: Maximum retry attempts (default: from environment config)
+            base_delay: Base delay between retries (default: from environment config)
             
         Returns:
             List of transcript segments with text and timing information
@@ -1294,35 +1531,50 @@ class TranscriptService:
         Raises:
             EnhancedTranscriptError: Enhanced error with detailed context and recovery suggestions
         """
+        # Use configured defaults if not specified
+        max_attempts = max_attempts or self.retry_max_attempts
+        base_delay = base_delay or self.retry_base_delay
+        
         self.logger.info(
-            f"🎯 Starting smart transcript fetch for video {video_id} in language {language}",
+            f"🎯 Starting advanced transcript fetch for video {video_id} in language {language}",
             extra={
-                "event": "smart_transcript_fetch_start",
+                "event": "advanced_transcript_fetch_start",
                 "video_id": video_id,
                 "language": language,
                 "max_attempts": max_attempts,
-                "base_delay": base_delay
+                "base_delay": base_delay,
+                "configuration": {
+                    "jitter_enabled": self.retry_enable_jitter,
+                    "rate_limit_respect": self.rate_limit_respect_headers,
+                    "max_delay": self.retry_max_delay
+                }
             }
         )
         
         try:
-            # Use smart retry logic
+            # Use advanced retry logic with environment configuration
             result = await self._execute_with_retry(
                 self._fetch_transcript_from_youtube,
                 video_id,
                 language,
                 max_attempts=max_attempts,
                 base_delay=base_delay,
-                max_delay=30.0  # 30 second max delay
+                max_delay=self.retry_max_delay
             )
             
             self.logger.info(
-                f"✅ Smart transcript fetch successful for video {video_id}",
+                f"✅ Advanced transcript fetch successful for video {video_id}",
                 extra={
-                    "event": "smart_transcript_fetch_success",
+                    "event": "advanced_transcript_fetch_success",
                     "video_id": video_id,
                     "language": language,
-                    "segments_count": len(result)
+                    "segments_count": len(result),
+                    "service_stats": {
+                        "total_service_retries": self.retry_metrics["successful_retries"],
+                        "service_success_rate": round(
+                            (self.retry_metrics["successful_retries"] / max(self.retry_metrics["total_attempts"], 1)) * 100, 2
+                        )
+                    }
                 }
             )
             
@@ -1330,13 +1582,17 @@ class TranscriptService:
             
         except Exception as e:
             self.logger.error(
-                f"❌ Smart transcript fetch failed for video {video_id}: {str(e)}",
+                f"❌ Advanced transcript fetch failed for video {video_id}: {str(e)}",
                 extra={
-                    "event": "smart_transcript_fetch_failure",
+                    "event": "advanced_transcript_fetch_failure",
                     "video_id": video_id,
                     "language": language,
                     "error_type": type(e).__name__,
-                    "error_message": str(e)
+                    "error_message": str(e),
+                    "service_stats": {
+                        "total_service_failures": self.retry_metrics["failed_retries"],
+                        "rate_limit_failures": self.retry_metrics["rate_limit_retries"]
+                    }
                 }
             )
             raise
@@ -1370,28 +1626,48 @@ class TranscriptService:
     
     def get_service_stats(self) -> Dict[str, Any]:
         """
-        Get service statistics and configuration
+        Get comprehensive service statistics including retry metrics
         
         Returns:
-            Dictionary with service stats
+            Dictionary with service statistics, retry metrics, and configuration
         """
+        retry_metrics = self.get_retry_metrics()
+        
         return {
-            "service": "TranscriptService",
-            "version": "1.0.0",
-            "configuration": {
-                "request_timeout": self.request_timeout,
-                "rate_limit_requests": self.rate_limit_requests,
-                "rate_limit_window": self.rate_limit_window
+            "service_info": {
+                "name": "YouTube Transcript Service",
+                "status": "operational",
+                "features": [
+                    "YouTube transcript fetching",
+                    "Multi-format output (JSON, text, SRT, VTT, FTS)",
+                    "Enhanced error handling",
+                    "Intelligent retry logic",
+                    "Rate limiting awareness",
+                    "Comprehensive monitoring"
+                ]
             },
-            "supported_formats": ["json", "text", "srt", "vtt"],
-            "supported_languages": ["en", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh"],
-            "features": [
-                "YouTube transcript fetching",
-                "Multi-language support",
-                "Multiple output formats",
-                "Error handling",
-                "Rate limiting"
-            ]
+            "configuration": {
+                "basic": {
+                    "request_timeout": self.request_timeout,
+                    "rate_limit_requests": self.rate_limit_requests,
+                    "rate_limit_window": self.rate_limit_window
+                },
+                "retry": retry_metrics["configuration"],
+                "advanced": {
+                    "rate_limit_retry_multiplier": self.rate_limit_retry_multiplier,
+                    "rate_limit_max_backoff": self.rate_limit_max_backoff,
+                    "rate_limit_respect_headers": self.rate_limit_respect_headers
+                }
+            },
+            "metrics": {
+                "retry_statistics": retry_metrics["retry_statistics"],
+                "performance_metrics": retry_metrics["performance_metrics"]
+            },
+            "health": {
+                "status": "healthy" if retry_metrics["retry_statistics"]["success_rate_percent"] > 50 else "degraded",
+                "uptime_hours": retry_metrics["performance_metrics"]["uptime_hours"],
+                "last_metrics_reset": retry_metrics["last_reset"]
+            }
         }
 
     def _convert_to_text_format(self, segments: List[TranscriptSegment]) -> str:
@@ -1506,4 +1782,38 @@ class TranscriptService:
         if hours > 0:
             return f"{hours:02d}:{minutes:02d}:{secs:02d}"
         else:
-            return f"{minutes:02d}:{secs:02d}" 
+            return f"{minutes:02d}:{secs:02d}"
+
+    def _log_smart_retry_decision(
+        self,
+        error: Exception,
+        attempt: int,
+        max_attempts: int,
+        decision: str,
+        retry_context: EnhancedRetryContext
+    ):
+        """Log smart retry decision with reasoning"""
+        log_data = {
+            "event": "smart_retry_decision",
+            "function": retry_context.function_name,
+            "video_id": retry_context.video_id,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "decision": decision,
+            "error_type": type(error).__name__,
+            "error_history": retry_context.error_history
+        }
+        
+        # Add reasoning for enhanced errors
+        if isinstance(error, EnhancedTranscriptError):
+            log_data.update({
+                "error_category": error.category.value,
+                "error_severity": error.severity.value,
+                "decision_reason": f"Category {error.category.value} is {'recoverable' if error.is_recoverable() else 'not recoverable'}"
+            })
+        
+        level = "info" if decision == "will_not_retry" else "warning"
+        getattr(self.logger, level)(
+            f"🧠 Smart retry decision: {decision} for {retry_context.function_name}",
+            extra=log_data
+        ) 
