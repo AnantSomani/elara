@@ -1,12 +1,12 @@
 # Core FastAPI dependencies
-fastapi>=0.108.0
-uvicorn[standard]>=0.25.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
 
 # YouTube transcript fetching
-youtube-transcript-api>=0.6.2
+youtube-transcript-api==0.6.2
 
 # Data validation and parsing (compatible with Python 3.13)
-pydantic>=2.7.0
+pydantic==2.5.0
 
 # HTTP client for external requests
 requests==2.31.0
@@ -19,8 +19,8 @@ python-dotenv==1.0.0
 python-multipart==0.0.6
 
 # Database dependencies
-asyncpg>=0.29.0
-supabase>=2.3.0
+asyncpg==0.29.0
+supabase==2.8.1
 sqlalchemy>=2.0.25
 
 # AI/ML dependencies for embeddings
@@ -29,4 +29,5 @@ numpy>=1.24.0
 
 # Development and testing (optional)
 pytest==7.4.3
-pytest-asyncio==0.21.1 
+pytest-asyncio==0.21.1
+isodate==0.6.1
