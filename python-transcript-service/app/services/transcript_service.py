@@ -897,13 +897,22 @@ class TranscriptService:
                 metadata["content_length"] = len(formatted_content)
                 metadata["line_count"] = formatted_content.count('\n') + 1
             
+            # Calculate segment count and total duration
+            segment_count = len(formatted_transcript) if isinstance(formatted_transcript, list) else 0
+            total_duration = None
+            if formatted_transcript:
+                last_segment = max(formatted_transcript, key=lambda x: x.start + x.duration)
+                total_duration = last_segment.start + last_segment.duration
+
             response = TranscriptResponse(
                 success=True,
                 video_id=clean_video_id,
                 language=language,
                 format=format_type,
-                transcript=formatted_content,
+                transcript=formatted_content if format_type != "json" else formatted_transcript,
                 metadata=metadata,
+                segment_count=segment_count,
+                total_duration=total_duration,
                 processing_time_ms=processing_time
             )
             
@@ -970,7 +979,7 @@ class TranscriptService:
         Format raw transcript data into TranscriptSegment objects
         
         Args:
-            raw_segments: Raw transcript data from YouTube API
+            raw_segments: Raw transcript data from YouTube API (FetchedTranscriptSnippet objects)
             
         Returns:
             List of formatted TranscriptSegment objects
@@ -979,10 +988,17 @@ class TranscriptService:
             formatted_segments = []
             
             for segment in raw_segments:
-                # Handle different possible formats from YouTube API
-                text = segment.get('text', '').strip()
-                start = float(segment.get('start', 0))
-                duration = float(segment.get('duration', 0))
+                # Handle FetchedTranscriptSnippet objects from youtube-transcript-api
+                if hasattr(segment, 'text'):
+                    # It's a FetchedTranscriptSnippet object
+                    text = getattr(segment, 'text', '').strip()
+                    start = float(getattr(segment, 'start', 0))
+                    duration = float(getattr(segment, 'duration', 0))
+                else:
+                    # It's a dictionary (fallback)
+                    text = segment.get('text', '').strip()
+                    start = float(segment.get('start', 0))
+                    duration = float(segment.get('duration', 0))
                 
                 if text:  # Only include segments with actual text
                     formatted_segment = TranscriptSegment(

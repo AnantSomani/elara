@@ -18,7 +18,14 @@ from .models import (
     TranscriptResponse,
     HealthResponse,
     ErrorResponse,
-    LanguagesResponse
+    LanguagesResponse,
+    SearchRequest,
+    SearchResponse,
+    SearchResult,
+    ProcessTranscriptRequest,
+    ProcessTranscriptResponse,
+    VideoMetadata,
+    DatabaseStatsResponse
 )
 from .services.transcript_service import (
     TranscriptService,
@@ -30,6 +37,7 @@ from .services.transcript_service import (
     RateLimitError
 )
 from .utils.youtube_utils import extract_video_id, validate_youtube_url
+from .database import db_manager
 
 # Load environment variables
 load_dotenv()
@@ -46,7 +54,18 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan handler"""
     logger.info("🚀 YouTube Transcript Service starting up...")
+    
+    # Initialize database
+    db_initialized = await db_manager.initialize()
+    if db_initialized:
+        logger.info("✅ Database connections established")
+    else:
+        logger.warning("⚠️ Database initialization failed - running without database features")
+    
     yield
+    
+    # Cleanup database connections
+    await db_manager.close()
     logger.info("🛑 YouTube Transcript Service shutting down...")
 
 
@@ -268,6 +287,255 @@ async def get_available_languages(video_id: str):
         )
 
 
+# Database-enabled endpoints
+
+@app.post("/transcript/process", response_model=ProcessTranscriptResponse, tags=["Database"])
+async def process_and_store_transcript(request: ProcessTranscriptRequest):
+    """
+    Process a YouTube transcript and store it in the database with embeddings
+    
+    - **video_url**: YouTube video URL or video ID
+    - **language**: Language code for transcript
+    - **generate_embeddings**: Whether to generate AI embeddings
+    - **save_to_database**: Whether to save to database
+    """
+    import time
+    start_time = time.time()
+    
+    try:
+        logger.info(f"🔄 Processing transcript for storage: {request.video_url}")
+        
+        # Extract video ID
+        video_id = extract_video_id(request.video_url)
+        if not video_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid YouTube URL or video ID"
+            )
+        
+        # Fetch transcript first
+        transcript_service = TranscriptService()
+        transcript_result = await transcript_service.fetch_transcript(
+            video_id=video_id,
+            language=request.language,
+            format_type="json"
+        )
+        
+        segments_saved = 0
+        embeddings_generated = 0
+        transcript_id = None
+        
+        if request.save_to_database and db_manager.pg_pool:
+            # Mock channel data (in real implementation, you'd fetch from YouTube API)
+            channel_data = {
+                'id': f'channel_{video_id}',  # Placeholder
+                'name': 'Unknown Channel',
+                'description': '',
+                'subscriber_count': 0,
+                'video_count': 0,
+                'view_count': 0
+            }
+            
+            # Mock video data
+            video_data = {
+                'id': video_id,
+                'channel_id': channel_data['id'],
+                'title': f'Video {video_id}',  # Placeholder
+                'description': '',
+                # published_at will be auto-generated in save_video_metadata if not provided
+                'duration_seconds': int(transcript_result.total_duration or 0),
+                'view_count': 0,
+                'like_count': 0,
+                'comment_count': 0,
+                'has_captions': True,
+                'transcript_status': 'completed',
+                'tags': [],
+                'category': ''
+            }
+            
+            # Save to database
+            logger.info(f"🔧 DEBUG: video_data being sent: {video_data}")
+            await db_manager.get_or_create_channel(channel_data)
+            await db_manager.save_video_metadata(video_data)
+            
+            # Save transcript
+            transcript_data = {
+                'language': request.language,
+                'content': ' '.join([seg.text for seg in transcript_result.transcript]),
+                'segment_count': len(transcript_result.transcript),
+                'total_duration': transcript_result.total_duration
+            }
+            
+            transcript_id = await db_manager.save_transcript(
+                video_id, channel_data['id'], transcript_data
+            )
+            
+            # Save segments
+            segments_data = [
+                {
+                    'text': seg.text,
+                    'start': seg.start,
+                    'end': seg.end,
+                    'duration': seg.duration,
+                    'keywords': []
+                }
+                for seg in transcript_result.transcript
+            ]
+            
+            await db_manager.save_transcript_segments(video_id, segments_data)
+            segments_saved = len(segments_data)
+            
+            # Generate embeddings if requested
+            if request.generate_embeddings and db_manager.openai_client:
+                # Generate embeddings for full transcript
+                full_text = transcript_data['content']
+                if full_text:
+                    embeddings = await db_manager.generate_embeddings(full_text)
+                    await db_manager.save_embeddings(
+                        transcript_id, 'transcript_full', full_text, embeddings
+                    )
+                    embeddings_generated += 1
+                
+                # Generate embeddings for segments (in chunks to avoid rate limits)
+                for i, segment in enumerate(segments_data[:10]):  # Limit to first 10 for demo
+                    if segment['text']:
+                        embeddings = await db_manager.generate_embeddings(segment['text'])
+                        await db_manager.save_embeddings(
+                            f"{video_id}_seg_{i}", 'transcript_chunk', 
+                            segment['text'], embeddings, {'segment_index': i}
+                        )
+                        embeddings_generated += 1
+        
+        processing_time = (time.time() - start_time) * 1000
+        
+        logger.info(f"✅ Processed transcript: {segments_saved} segments, {embeddings_generated} embeddings")
+        
+        return ProcessTranscriptResponse(
+            success=True,
+            video_id=video_id,
+            transcript_id=transcript_id,
+            segments_saved=segments_saved,
+            embeddings_generated=embeddings_generated,
+            processing_time_ms=processing_time,
+            metadata={
+                'language': request.language,
+                'total_duration': transcript_result.total_duration,
+                'segment_count': len(transcript_result.transcript)
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Error processing transcript: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process transcript: {str(e)}"
+        )
+
+
+@app.post("/search", response_model=SearchResponse, tags=["Database"])
+async def search_transcripts(request: SearchRequest):
+    """
+    Search YouTube transcripts using 4-dimensional RAG
+    
+    - **query**: Search query text
+    - **limit**: Maximum number of results (1-50)
+    - **strategy**: Search strategy (auto, fts, vector, hybrid, metadata)
+    - **filters**: Additional filters
+    """
+    import time
+    start_time = time.time()
+    
+    try:
+        logger.info(f"🔍 Searching transcripts: '{request.query}' (strategy: {request.strategy})")
+        
+        if not db_manager.pg_pool:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database not available"
+            )
+        
+        # Perform search
+        results = await db_manager.search_transcripts(request.query, request.limit)
+        
+        # Convert to response format
+        search_results = []
+        for result in results:
+            search_results.append(SearchResult(
+                id=result.get('id', ''),
+                content_type=result.get('content_type', ''),
+                content=result.get('content', ''),
+                relevance_score=float(result.get('relevance_score', 0)),
+                video_id=result.get('video_id', ''),
+                channel_id=result.get('channel_id', ''),
+                video_title=result.get('video_title', ''),
+                channel_name=result.get('channel_name', ''),
+                start_time=result.get('start_time'),
+                metadata=result.get('metadata', {}),
+                search_strategy=result.get('search_strategy', 'auto')
+            ))
+        
+        execution_time = (time.time() - start_time) * 1000
+        
+        logger.info(f"✅ Search completed: {len(search_results)} results in {execution_time:.1f}ms")
+        
+        return SearchResponse(
+            success=True,
+            query=request.query,
+            results=search_results,
+            total_results=len(search_results),
+            search_strategy=request.strategy,
+            execution_time_ms=execution_time
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Search error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Search failed: {str(e)}"
+        )
+
+
+@app.get("/database/stats", response_model=DatabaseStatsResponse, tags=["Database"])
+async def get_database_stats():
+    """
+    Get database statistics and health information
+    """
+    try:
+        if not db_manager.pg_pool:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database not available"
+            )
+        
+        async with db_manager.pg_pool.acquire() as conn:
+            # Get basic counts
+            video_count = await conn.fetchval("SELECT COUNT(*) FROM youtube_videos")
+            transcript_count = await conn.fetchval("SELECT COUNT(*) FROM youtube_transcripts")
+            segment_count = await conn.fetchval("SELECT COUNT(*) FROM youtube_transcript_segments")
+            embedding_count = await conn.fetchval("SELECT COUNT(*) FROM youtube_embeddings")
+            channel_count = await conn.fetchval("SELECT COUNT(*) FROM youtube_channels")
+            
+            # Get cache stats
+            cache_stats = await conn.fetch("SELECT * FROM get_youtube_cache_stats()")
+            cache_data = {row['cache_type']: dict(row) for row in cache_stats}
+        
+        return DatabaseStatsResponse(
+            total_videos=video_count or 0,
+            total_transcripts=transcript_count or 0,
+            total_segments=segment_count or 0,
+            total_embeddings=embedding_count or 0,
+            total_channels=channel_count or 0,
+            cache_stats=cache_data
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Database stats error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get database stats: {str(e)}"
+        )
+
+
 # Root endpoint
 @app.get("/", tags=["Root"])
 async def root():
@@ -275,10 +543,23 @@ async def root():
     Root endpoint with service information
     """
     return {
-        "message": "YouTube Transcript Service",
+        "message": "YouTube Transcript Service with 4D RAG",
         "version": os.getenv("SERVICE_VERSION", "1.0.0"),
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "features": [
+            "YouTube transcript fetching",
+            "4-dimensional RAG search",
+            "Vector embeddings",
+            "Full-text search",
+            "Hybrid search",
+            "Metadata search"
+        ],
+        "database_endpoints": {
+            "process": "/transcript/process",
+            "search": "/search",
+            "stats": "/database/stats"
+        }
     }
 
 

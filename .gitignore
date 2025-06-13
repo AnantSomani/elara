@@ -80,3 +80,9 @@ logs
 # AI service specific
 /transcriptions/
 /audio-cache/ 
+
+# Python service
+python-transcript-service/__pycache__/
+python-transcript-service/*.py[cod]
+python-transcript-service/venv/
+python-transcript-service/.env
