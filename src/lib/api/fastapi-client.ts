@@ -97,11 +97,11 @@ export class FastAPIClient {
     return this.request<TranscriptData>(`/transcripts/${transcriptId}`);
   }
 
-  // Add new transcript
+  // Add new transcript from YouTube URL
   async addTranscript(
     youtubeUrl: string
   ): Promise<FastAPIResponse<{ transcript_id: string }>> {
-    return this.request('/transcripts', {
+    return this.request('/transcripts/from-youtube/', {
       method: 'POST',
       body: JSON.stringify({ youtube_url: youtubeUrl }),
     });
