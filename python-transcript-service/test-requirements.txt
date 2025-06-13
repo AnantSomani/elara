@@ -16,4 +16,5 @@ freezegun==1.2.2  # For time-based testing
 responses==0.24.1  # For HTTP mocking
 
 # Load existing dependencies
--r requirements.txt 
+-r requirements.txt httpx>=0.25.0
+pytest-mock>=3.12.0
