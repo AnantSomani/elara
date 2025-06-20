@@ -1,4 +1,4 @@
-const FASTAPI_BASE_URL = process.env.FASTAPI_URL || 'http://localhost:8001';
+const FASTAPI_BASE_URL = process.env.FASTAPI_URL || 'http://localhost:6000';
 
 interface FastAPIResponse<T> {
   success: boolean;

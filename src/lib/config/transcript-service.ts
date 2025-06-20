@@ -38,7 +38,7 @@ const getEnvBoolean = (key: string, defaultValue: boolean): boolean => {
 export const transcriptServiceConfig = {
   // Core API configuration
   api: {
-    baseUrl: getEnvVar('NEXT_PUBLIC_TRANSCRIPT_SERVICE_URL', 'http://localhost:8001'),
+    baseUrl: getEnvVar('NEXT_PUBLIC_TRANSCRIPT_SERVICE_URL', 'http://localhost:6000'),
     timeout: getEnvNumber('TRANSCRIPT_SERVICE_TIMEOUT', 30000),
     retryAttempts: getEnvNumber('TRANSCRIPT_SERVICE_RETRY_ATTEMPTS', 3),
     retryDelay: getEnvNumber('TRANSCRIPT_SERVICE_RETRY_DELAY', 1000),

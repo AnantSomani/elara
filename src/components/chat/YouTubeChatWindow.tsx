@@ -45,6 +45,9 @@ export default function YouTubeChatWindow({
       if (response.ok) {
         const data = await response.json()
         setTranscriptAvailable(data.available)
+        if (data.message) {
+          console.log('✅ Backend processed video:', data.message)
+        }
       } else {
         setTranscriptAvailable(false)
       }

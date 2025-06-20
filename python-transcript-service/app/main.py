@@ -7,6 +7,7 @@ import os
 import time
 import logging
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
 import requests
@@ -17,8 +18,13 @@ import uuid
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
+from openai import OpenAI
+from supabase import create_client, Client
+import psycopg2
+from urllib.parse import urlparse
 
 # We'll define models inline instead of importing from models_simplified
 
@@ -44,6 +50,17 @@ SUPABASE_HEADERS = {
     'Content-Type': 'application/json',
     'Prefer': 'return=representation'
 }
+
+# OpenAI configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("Missing OpenAI API key. Please check your environment variables.")
+
+# Initialize OpenAI client
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Initialize Supabase client for proper vector handling
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==========================================
 # Data Models
@@ -128,6 +145,102 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> List[st
     
     return chunks
 
+def get_postgres_connection():
+    """Get direct PostgreSQL connection for vector operations"""
+    # Parse Supabase URL to get connection details
+    supabase_url = SUPABASE_URL.replace('https://', '')
+    
+    # Supabase connection details
+    # Format: https://PROJECT_ID.supabase.co
+    project_id = supabase_url.split('.')[0]
+    
+    # Get password from environment
+    db_password = os.getenv('SUPABASE_DB_PASSWORD')
+    if not db_password:
+        logger.error("❌ SUPABASE_DB_PASSWORD not found in environment variables")
+        raise ValueError("Missing SUPABASE_DB_PASSWORD")
+    
+    conn_params = {
+        'host': f'db.{project_id}.supabase.co',
+        'port': '5432',
+        'database': 'postgres',
+        'user': 'postgres',
+        'password': db_password,
+    }
+    
+    logger.info(f"🔗 Connecting to PostgreSQL: {conn_params['host']}")
+    return psycopg2.connect(**conn_params)
+
+def insert_chunk_with_vector(chunk_data):
+    """Insert chunk with proper vector using direct PostgreSQL connection"""
+    try:
+        print("🚀 USING POSTGRESQL DIRECT INSERT - NOT SUPABASE!")
+        logger.info(f"🔄 Attempting direct PostgreSQL insertion for chunk {chunk_data.get('chunk_index', 'unknown')}")
+        
+        # Add extensive debugging
+        logger.info(f"📊 Environment check:")
+        logger.info(f"    SUPABASE_URL: {bool(os.getenv('NEXT_PUBLIC_SUPABASE_URL'))}")
+        logger.info(f"    DB_PASSWORD: {bool(os.getenv('SUPABASE_DB_PASSWORD'))}")
+        
+        conn = get_postgres_connection()
+        cursor = conn.cursor()
+        
+        # Debug the embedding data
+        embedding = chunk_data['embedding']
+        logger.info(f"📊 Embedding type: {type(embedding)}, length: {len(embedding)}")
+        logger.info(f"📊 Chunk data keys: {list(chunk_data.keys())}")
+        
+        # Test connection first
+        cursor.execute("SELECT 1")
+        test_result = cursor.fetchone()
+        logger.info(f"📊 Connection test result: {test_result}")
+        
+        # Insert with proper vector casting
+        logger.info("📤 Executing INSERT statement...")
+        cursor.execute("""
+            INSERT INTO youtube_transcript_chunks 
+            (video_id, chunk_index, start_time, end_time, text, word_count, metadata, embedding)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector(1536))
+        """, (
+            chunk_data['video_id'],
+            chunk_data['chunk_index'],
+            chunk_data['start_time'],
+            chunk_data['end_time'],
+            chunk_data['text'],
+            chunk_data['word_count'],
+            json.dumps(chunk_data['metadata']) if 'metadata' in chunk_data else '{}',
+            embedding  # Pass as list, PostgreSQL will convert
+        ))
+        
+        conn.commit()
+        logger.info("📤 INSERT committed successfully")
+        
+        # Verify the insertion worked (simpler verification without array_length)
+        cursor.execute("""
+            SELECT chunk_id, pg_typeof(embedding)
+            FROM youtube_transcript_chunks 
+            WHERE video_id = %s AND chunk_index = %s
+        """, (chunk_data['video_id'], chunk_data['chunk_index']))
+        
+        result = cursor.fetchone()
+        if result:
+            chunk_id, embedding_type = result
+            logger.info(f"✅ Verification: chunk_id={chunk_id}, type={embedding_type}")
+        else:
+            logger.warning("⚠️ Could not verify insertion - no record found")
+        
+        cursor.close()
+        conn.close()
+        logger.info(f"✅ Direct PostgreSQL insertion successful for chunk {chunk_data.get('chunk_index', 'unknown')}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Direct PostgreSQL insertion failed for chunk {chunk_data.get('chunk_index', 'unknown')}: {e}")
+        logger.error(f"Error type: {type(e)}")
+        logger.error(f"Error details: {str(e)}")
+        # Don't return False - raise the exception so we can see what's wrong
+        raise e
+
 # ==========================================
 # Core Endpoints
 # ==========================================
@@ -164,7 +277,7 @@ app = FastAPI(
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8080"],
+    allow_origins=["http://localhost:3000", "http://localhost:8080", "http://localhost:8081"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -237,9 +350,11 @@ async def fetch_and_store_youtube_transcript(
         
         # Fetch transcript from YouTube
         logger.info(f"Fetching transcript for video: {video_id}")
-        if language := request.youtube_url.split('&')[0].split('=')[-1]:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=[language])
-        else:
+        try:
+            # Try to get transcript with default language preference
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+        except Exception:
+            # If English not available, try auto-generated or any available language
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
         
         # Combine transcript text
@@ -248,58 +363,121 @@ async def fetch_and_store_youtube_transcript(
         if not full_text.strip():
             raise HTTPException(status_code=404, detail="No transcript found for this video")
         
-        # Store transcript in Supabase
-        stored_transcript = store_transcript_supabase(video_id, transcript_list)
-        
-        if stored_transcript:
+        # Store transcript in Supabase with simplified approach
+        try:
+            stored_transcript = store_transcript_supabase(video_id, transcript_list)
             logger.info(f"✅ Transcript stored successfully for video {video_id}")
-            
-            # Create chunks for better search (background task)
-            background_tasks.add_task(create_transcript_chunks, video_id, full_text)
-            
-            return APIResponse(
-                success=True,
-                message="Transcript fetched and stored successfully",
-                data=stored_transcript
-            )
-        else:
-            raise HTTPException(status_code=500, detail="Failed to store transcript")
+        except Exception as storage_error:
+            logger.warning(f"⚠️ Could not store in database: {storage_error}")
+            stored_transcript = {
+                "video_id": video_id,
+                "content": full_text,
+                "segment_count": len(transcript_list),
+                "total_duration": sum([segment.get('duration', 0) for segment in transcript_list])
+            }
+        
+        # Create chunks for better search (background task) - this will also create embeddings
+        background_tasks.add_task(create_transcript_chunks, video_id, full_text)
+        
+        return APIResponse(
+            success=True,
+            message=f"Transcript fetched successfully! Processing {len(transcript_list)} segments into chunks with embeddings.",
+            data=stored_transcript
+        )
             
     except Exception as e:
         logger.error(f"❌ Error processing YouTube video {request.youtube_url}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to process video: {str(e)}")
 
 async def create_transcript_chunks(video_id: str, transcript_text: str):
-    """Background task to create searchable chunks"""
+    """Background task to create searchable chunks and embeddings"""
     try:
         chunks = chunk_text(transcript_text, chunk_size=800, overlap=100)
+        logger.info(f"🔄 Creating {len(chunks)} chunks and embeddings for video {video_id}")
         
         chunk_data = []
         for i, chunk in enumerate(chunks):
-            chunk_data.append({
-                'transcript_id': video_id,
-                'chunk_index': i,
-                'content': chunk,
-                'word_count': len(chunk.split())
-            })
+            try:
+                # Create embedding for this chunk
+                embedding_response = openai_client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=chunk
+                )
+                embedding = embedding_response.data[0].embedding
+                
+                # Keep embedding as array - Supabase REST API handles the VECTOR type conversion
+                chunk_data.append({
+                    'video_id': video_id,
+                    'chunk_index': i,
+                    'start_time': float(i * 800),  # Ensure DECIMAL format compatibility
+                    'end_time': float((i + 1) * 800),  # Ensure DECIMAL format compatibility
+                    'text': chunk,
+                    'word_count': len(chunk.split()),
+                    'metadata': {
+                        'total_chunks': len(chunks),
+                        'chunk_size': 800,
+                        'overlap': 100,
+                        'video_url': f'https://www.youtube.com/watch?v={video_id}',
+                        'has_embedding': True
+                    },
+                    'embedding': embedding
+                })
+                logger.info(f"✅ Created embedding for chunk {i+1}/{len(chunks)}")
+                
+            except Exception as embedding_error:
+                logger.error(f"❌ Error creating embedding for chunk {i}: {embedding_error}")
+                # Store chunk without embedding
+                chunk_data.append({
+                    'video_id': video_id,
+                    'chunk_index': i,
+                    'start_time': float(i * 800),  # Ensure DECIMAL format compatibility
+                    'end_time': float((i + 1) * 800),  # Ensure DECIMAL format compatibility
+                    'text': chunk,
+                    'word_count': len(chunk.split()),
+                    'metadata': {
+                        'total_chunks': len(chunks),
+                        'chunk_size': 800,
+                        'overlap': 100,
+                        'video_url': f'https://www.youtube.com/watch?v={video_id}',
+                        'has_embedding': False
+                    }
+                })
         
-        # Insert chunks if table exists
+        # Insert chunks with embeddings using raw SQL for proper vector handling
         try:
-            response = requests.post(
-                f"{SUPABASE_URL}/rest/v1/transcript_chunks",
-                json=chunk_data,
-                headers=SUPABASE_HEADERS,
-                timeout=30
-            )
-            if response.status_code == 200:
-                logger.info(f"✅ Created {len(chunks)} chunks for video {video_id}")
-            else:
-                logger.warning(f"⚠️ Could not create chunks (table may not exist): {response.status_code} - {response.text}")
+            logger.info(f"📤 Attempting to store {len(chunk_data)} chunks for video {video_id}")
+            logger.info(f"📊 Sample chunk keys: {list(chunk_data[0].keys()) if chunk_data else 'No chunks'}")
+            
+            # FORCE PostgreSQL usage - NO FALLBACK to Supabase client
+            chunks_with_embeddings = 0
+            chunks_without_embeddings = 0
+            
+            for chunk in chunk_data:
+                if 'embedding' in chunk and chunk['embedding'] is not None:
+                    # ONLY use direct PostgreSQL insertion for vectors - no fallback
+                    logger.info(f"🔄 Processing chunk {chunk['chunk_index']} with embedding...")
+                    insert_chunk_with_vector(chunk)  # This will raise exception if it fails
+                    chunks_with_embeddings += 1
+                    logger.info(f"✅ Chunk {chunk['chunk_index']} inserted successfully with PostgreSQL")
+                else:
+                    # For chunks without embeddings, we can still use Supabase (no vector involved)
+                    chunk_without_embedding = {k: v for k, v in chunk.items() if k != 'embedding'}
+                    supabase.table('youtube_transcript_chunks').insert(chunk_without_embedding).execute()
+                    chunks_without_embeddings += 1
+                    logger.info(f"✅ Chunk {chunk['chunk_index']} inserted without embedding")
+            
+            logger.info(f"🎉 Successfully stored {len(chunk_data)} chunks for video {video_id}")
+            logger.info(f"📊 Chunks with embeddings: {chunks_with_embeddings}")
+            logger.info(f"📊 Chunks without embeddings: {chunks_without_embeddings}")
+                
         except Exception as chunk_error:
-            logger.warning(f"⚠️ Could not create chunks: {chunk_error}")
+            logger.error(f"❌ Exception storing chunks: {chunk_error}")
+            logger.error(f"❌ Error type: {type(chunk_error)}")
+            logger.error(f"❌ Error details: {str(chunk_error)}")
+            raise chunk_error  # Re-raise so we can see the actual problem
             
     except Exception as e:
-        logger.error(f"❌ Error creating chunks for {video_id}: {e}")
+        logger.error(f"❌ Error creating chunks and embeddings for {video_id}: {e}")
 
 # ==========================================
 # Search Endpoints  
@@ -432,32 +610,28 @@ async def root():
         }
     }
 
-def store_transcript_supabase(video_id: str, transcript_data: List[Dict], channel_id: str = "unknown") -> Dict[str, Any]:
-    """Store transcript in Supabase using direct REST API calls"""
+def store_transcript_supabase(video_id: str, transcript_data: List[Dict]) -> Dict[str, Any]:
+    """Store transcript in Supabase - simplified version without metadata dependencies"""
     
-    # Calculate metrics
+    # Calculate metrics from transcript data
     total_content = " ".join([segment.get('text', '') for segment in transcript_data])
     total_duration = sum([segment.get('duration', 0) for segment in transcript_data])
     segment_count = len(transcript_data)
     
-    # Prepare payload matching your schema
-    payload = {
-        "id": str(uuid.uuid4()),
-        "video_id": video_id,
-        "channel_id": channel_id,
-        "content": total_content,
-        "segment_count": segment_count,
-        "total_duration": total_duration,
-        "language": "en",  # Default, could be detected
-        "format": "json",
-        "source": "youtube-transcript-api",
-        "confidence_score": 0.95,  # Default confidence
-        "processing_time_ms": None,
-        "api_version": "3.0.0"
-    }
-    
     try:
-        # Insert into youtube_transcripts table
+        # Prepare simplified transcript payload - no channel_id required
+        payload = {
+            "video_id": video_id,
+            "content": total_content[:50000] if len(total_content) > 50000 else total_content,
+            "segment_count": segment_count,
+            "total_duration": round(float(total_duration), 2),
+            "language": "en",
+            "format": "json",
+            "source": "auto",
+            "confidence_score": 0.95
+        }
+        
+        # Insert directly into youtube_transcripts table
         response = requests.post(
             f"{SUPABASE_URL}/rest/v1/youtube_transcripts",
             json=payload,
@@ -471,14 +645,14 @@ def store_transcript_supabase(video_id: str, transcript_data: List[Dict], channe
                 return result[0]
             return payload
         else:
-            print(f"❌ Supabase error: {response.status_code} - {response.text}")
+            logger.error(f"❌ Supabase error: {response.status_code} - {response.text}")
             raise HTTPException(
                 status_code=500, 
                 detail=f"Failed to store in Supabase: {response.status_code} - {response.text[:200]}"
             )
             
     except requests.exceptions.RequestException as e:
-        print(f"❌ Network error storing transcript: {e}")
+        logger.error(f"❌ Network error storing transcript: {e}")
         raise HTTPException(status_code=500, detail=f"Network error: {str(e)}")
 
 def get_transcript_from_supabase(video_id: str) -> Optional[Dict[str, Any]]:

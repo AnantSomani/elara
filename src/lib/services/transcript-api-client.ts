@@ -25,7 +25,7 @@ import {
  * Default configuration for the API client
  */
 const DEFAULT_CONFIG: ApiClientConfig = {
-  baseUrl: 'http://localhost:8001',
+      baseUrl: 'http://localhost:6000',
   timeout: 30000,        // 30 seconds
   retryAttempts: 3,
   retryDelay: 1000,      // 1 second

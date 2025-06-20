@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { YouTubeTranscriptService } from '@/lib/services/youtube-real-time-transcript'
 
 export async function GET(
   request: NextRequest,
@@ -17,16 +16,38 @@ export async function GET(
 
     console.log(`🔍 Checking transcript availability for video: ${videoId}`)
 
-    const transcriptService = YouTubeTranscriptService.getInstance()
-    const isAvailable = await transcriptService.checkTranscriptAvailability(videoId)
-
-    console.log(`📋 Transcript availability for ${videoId}: ${isAvailable}`)
-
-    return NextResponse.json({
-      success: true,
-      available: isAvailable,
-      videoId
+    // Call our Python backend service to process the video
+    const backendResponse = await fetch('http://localhost:8002/transcripts/from-youtube/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        youtube_url: `https://www.youtube.com/watch?v=${videoId}`
+      })
     })
+
+    if (backendResponse.ok) {
+      const data = await backendResponse.json()
+      console.log(`✅ Backend processed video: ${data.message}`)
+      
+      return NextResponse.json({
+        success: true,
+        available: data.success,
+        videoId,
+        message: data.message
+      })
+    } else {
+      const errorData = await backendResponse.json()
+      console.error(`❌ Backend error: ${errorData.detail}`)
+      
+      return NextResponse.json({
+        success: true,
+        available: false,
+        videoId,
+        error: errorData.detail
+      })
+    }
 
   } catch (error) {
     console.error('Transcript check API error:', error)
