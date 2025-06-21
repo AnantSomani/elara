@@ -17,7 +17,7 @@ export async function GET(
     console.log(`🔍 Checking transcript availability for video: ${videoId}`)
 
     // Call our Python backend service to process the video
-    const backendResponse = await fetch('http://localhost:8002/transcripts/from-youtube/', {
+    const backendResponse = await fetch('http://localhost:8001/transcripts/from-youtube/', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

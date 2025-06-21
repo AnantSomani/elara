@@ -4,7 +4,7 @@ Based on user's proposed cleaner architecture
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 # ==========================================
@@ -103,7 +103,8 @@ class APIResponse(BaseModel):
     """Generic API response wrapper"""
     success: bool
     message: str
-    data: Optional[dict] = None
+    data: Optional[Dict[str, Any]] = None
+    count: Optional[int] = None
 
 class ErrorResponse(BaseModel):
     """Error response model"""
@@ -142,4 +143,77 @@ class OpenAIConfig(BaseModel):
     """OpenAI API configuration"""
     api_key: str
     model: str = Field("text-embedding-3-small", description="Embedding model")
-    dimensions: int = Field(1536, description="Embedding dimensions") 
+    dimensions: int = Field(1536, description="Embedding dimensions")
+
+class YouTubeURLRequest(BaseModel):
+    youtube_url: str = Field(..., description="YouTube video URL")
+    
+class SearchRequest(BaseModel):
+    query: str = Field(..., description="Search query")
+    limit: int = Field(10, description="Maximum number of results", ge=1, le=50)
+
+class TranscriptSegment(BaseModel):
+    text: str
+    start: float
+    duration: float
+
+class TranscriptResponse(BaseModel):
+    id: str
+    video_id: str
+    channel_id: str
+    content: str
+    segment_count: int
+    total_duration: float
+    language: str
+    format: str
+    source: str
+    confidence_score: float
+    processing_time_ms: Optional[int] = None
+    api_version: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+class TranscriptRequest(BaseModel):
+    video_id: str
+    language: Optional[str] = None
+
+# ==========================================
+# RAG Models (Phase 1)
+# ==========================================
+
+class RAGRequest(BaseModel):
+    """Request model for RAG queries"""
+    query: str = Field(..., description="User question or query", min_length=1, max_length=1000)
+    video_id: Optional[str] = Field(None, description="Optional filter by specific video ID")
+    top_k: int = Field(5, description="Number of relevant chunks to retrieve", ge=1, le=20)
+
+class RAGSourceDocument(BaseModel):
+    """Source document information in RAG response"""
+    text: str = Field(..., description="Excerpt from the source chunk")
+    video_id: Optional[str] = Field(None, description="Video ID this chunk belongs to")
+    start_time: Optional[float] = Field(None, description="Start time in seconds")
+    end_time: Optional[float] = Field(None, description="End time in seconds")
+    chunk_index: Optional[int] = Field(None, description="Index of this chunk in the video")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+class RAGMetadata(BaseModel):
+    """Metadata about the RAG processing"""
+    processing_time_ms: int = Field(..., description="Processing time in milliseconds")
+    source_count: int = Field(..., description="Number of source documents retrieved")
+    video_id: Optional[str] = Field(None, description="Video ID filter used")
+    retrieval_method: str = Field(..., description="Type of retrieval used (semantic, hybrid, etc.)")
+    request_id: str = Field(..., description="Unique request identifier")
+    error: Optional[str] = Field(None, description="Error message if query failed")
+
+class RAGResponse(BaseModel):
+    """Response model for RAG queries"""
+    answer: str = Field(..., description="Generated answer based on retrieved context")
+    sources: List[RAGSourceDocument] = Field(default_factory=list, description="Source documents used")
+    metadata: RAGMetadata = Field(..., description="Processing metadata")
+
+class RAGTestResponse(BaseModel):
+    """Response model for RAG system testing"""
+    success: bool = Field(..., description="Whether the test was successful")
+    document_count: Optional[int] = Field(None, description="Number of documents found")
+    sample_docs: Optional[List[Dict[str, Any]]] = Field(None, description="Sample documents for debugging")
+    error: Optional[str] = Field(None, description="Error message if test failed") 

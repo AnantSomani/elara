@@ -1,7 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { HybridRAGEngine } from '@/lib/ai/hybrid-rag-engine'
-import { CostMonitor } from '@/lib/monitoring/cost-monitor'
-import type { ProcessedVideo } from '@/types/youtube-chat'
 
 interface YouTubeChatRequest {
   question: string
@@ -28,58 +25,51 @@ export async function POST(request: NextRequest) {
 
     console.log(`💬 YouTube chat request for video ${videoId}: "${question}"`)
 
-    // Initialize services
-    const hybridRAG = HybridRAGEngine.getInstance()
-    const costMonitor = CostMonitor.getInstance()
-
     try {
-      // Use hybrid RAG engine for processing
-      const ragContext = await hybridRAG.getContextForQuestion(question, {
-        type: 'youtube',
-        data: {
-          videoId,
-          videoTitle: context.videoTitle,
-          channelTitle: context.channelTitle,
-          duration: context.duration,
-                     description: undefined
-        }
+      // Call our new RAG API endpoint
+      const ragResponse = await fetch('http://localhost:8001/rag/basic', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: question,
+          video_id: videoId,
+          max_results: 5
+        }),
       })
 
-      // Generate AI response using hybrid engine
-      const aiResponse = await hybridRAG.generateResponse(question, ragContext)
+      if (!ragResponse.ok) {
+        throw new Error(`RAG API failed: ${ragResponse.status}`)
+      }
 
-      // Track costs
-      await costMonitor.trackOperation(
-        'youtube-chat',
-        ragContext.cost,
-        'youtube',
-        { videoId, hasTranscript: ragContext.metadata.hasTranscript }
-      )
+      const ragData = await ragResponse.json()
 
-      console.log(`✅ YouTube chat response generated for ${videoId} (cost: $${ragContext.cost.toFixed(4)})`)
+      console.log(`✅ YouTube chat response generated for ${videoId} (${ragData.metadata.processing_time_ms}ms)`)
+
+      // Format response for frontend (clean, no source attribution for MVP)
+      let responseText = ragData.answer
 
       return NextResponse.json({
         success: true,
-        response: aiResponse.message,
-        cost: ragContext.cost,
+        response: responseText,
+        cost: 0.01, // Estimated cost for RAG query
         metadata: {
           videoId,
-          hasTranscript: ragContext.metadata.hasTranscript,
-          processingTier: ragContext.metadata.processingTier,
-          confidence: ragContext.confidence,
-          suggestions: aiResponse.suggestions,
-          costSavingMode: costMonitor.isCostSavingMode()
+          hasTranscript: ragData.sources.length > 0,
+          processingTier: 'rag',
+          confidence: 0.9,
+          processingTime: ragData.metadata.processing_time_ms,
+          sourceCount: ragData.sources.length
         }
       })
 
     } catch (ragError) {
-      console.error('Hybrid RAG processing failed, using fallback:', ragError)
+      console.error('RAG processing failed, using fallback:', ragError)
       
       // Fallback to simple response
-      const fallbackResponse = `I'd love to help you with "${question}" about "${context.videoTitle}" by ${context.channelTitle}. Let me see what I can find about this video.`
+      const fallbackResponse = `I'd love to help you with "${question}" about "${context.videoTitle}" by ${context.channelTitle}. I'm having some technical difficulties with the transcript system right now, but I can still discuss general topics about this video.`
       const fallbackCost = 0.001
-
-      await costMonitor.trackOperation('youtube-chat-fallback', fallbackCost, 'youtube')
 
       return NextResponse.json({
         success: true,

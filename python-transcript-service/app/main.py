@@ -26,11 +26,30 @@ from supabase import create_client, Client
 import psycopg2
 from urllib.parse import urlparse
 
-# We'll define models inline instead of importing from models_simplified
+# RAG imports (Phase 1)
+from .services.semantic_rag import create_semantic_rag_service
+from .models import (
+    RAGRequest, RAGResponse, RAGTestResponse, 
+    RAGSourceDocument, RAGMetadata,
+    # Existing models
+    YouTubeURLRequest, SearchRequest, APIResponse,
+    TranscriptResponse, TranscriptRequest, TranscriptSegment
+)
 
-# Load environment variables
-load_dotenv()
-load_dotenv('../.env.local')
+# Load environment variables more robustly
+load_dotenv()  # Load from .env
+load_dotenv('.env.local')  # Load from .env.local in current directory
+load_dotenv('../.env.local')  # Load from .env.local in parent directory
+load_dotenv('../../.env.local')  # Load from .env.local in project root
+
+# Also try loading from absolute path
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+env_local_path = os.path.join(project_root, '.env.local')
+if os.path.exists(env_local_path):
+    load_dotenv(env_local_path)
+    print(f"✅ Loaded .env.local from: {env_local_path}")
+else:
+    print(f"❌ .env.local not found at: {env_local_path}")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -590,6 +609,140 @@ async def list_transcripts(limit: int = Query(10, ge=1, le=100)):
         raise HTTPException(status_code=500, detail=f"Failed to list transcripts: {str(e)}")
 
 # ==========================================
+# RAG Endpoints (Phase 1)
+# ==========================================
+
+@app.post("/rag/basic", response_model=RAGResponse, tags=["RAG"])
+async def basic_rag_query(request: RAGRequest):
+    """
+    Basic semantic RAG query using LangChain + existing embeddings
+    Phase 1: Pure semantic search with LLM generation
+    """
+    logger.info(f"🔍 RAG query received: '{request.query[:100]}...'")
+    
+    try:
+        # Create fresh service instance to avoid memory leaks
+        rag_service = create_semantic_rag_service()
+        
+        # Execute query
+        result = await rag_service.query(
+            question=request.query,
+            video_id=request.video_id,
+            top_k=request.top_k
+        )
+        
+        # Convert to response model
+        response = RAGResponse(
+            answer=result["answer"],
+            sources=[
+                RAGSourceDocument(
+                    text=source["text"],
+                    video_id=source["video_id"],
+                    start_time=source["start_time"],
+                    end_time=source["end_time"],
+                    chunk_index=source["chunk_index"],
+                    metadata=source["metadata"]
+                )
+                for source in result["sources"]
+            ],
+            metadata=RAGMetadata(**result["metadata"])
+        )
+        
+        logger.info(f"✅ RAG query completed: {len(response.sources)} sources, {response.metadata.processing_time_ms}ms")
+        return response
+        
+    except Exception as e:
+        logger.error(f"❌ RAG query failed: {e}")
+        # Return error response in consistent format
+        return RAGResponse(
+            answer=f"I apologize, but I encountered an error processing your question: {str(e)}",
+            sources=[],
+            metadata=RAGMetadata(
+                processing_time_ms=0,
+                source_count=0,
+                video_id=request.video_id,
+                retrieval_method="semantic",
+                request_id="error",
+                error=str(e)
+            )
+        )
+
+@app.get("/rag/test", response_model=RAGTestResponse, tags=["RAG"])
+async def test_rag_system(test_query: str = Query("What is this video about?", description="Test query")):
+    """
+    Test the RAG system connectivity and basic retrieval
+    Useful for debugging and health checks
+    """
+    logger.info(f"🧪 RAG system test with query: '{test_query}'")
+    
+    try:
+        # Create fresh service instance
+        rag_service = create_semantic_rag_service()
+        
+        # Test retrieval only (no LLM generation)
+        result = await rag_service.test_retrieval(test_query)
+        
+        return RAGTestResponse(**result)
+        
+    except Exception as e:
+        logger.error(f"❌ RAG test failed: {e}")
+        return RAGTestResponse(
+            success=False,
+            error=str(e)
+        )
+
+@app.get("/rag/health", response_model=APIResponse, tags=["RAG"])
+async def rag_health_check():
+    """
+    Health check specifically for RAG system components
+    Tests LangChain, PostgreSQL, and OpenAI connectivity
+    """
+    logger.info("🏥 RAG health check starting...")
+    
+    health_status = {
+        "langchain_config": False,
+        "database_connection": False,
+        "openai_connection": False,
+        "errors": []
+    }
+    
+    try:
+        # Test LangChain configuration
+        from .services.langchain_config import get_langchain_config
+        config = get_langchain_config()
+        health_status["langchain_config"] = True
+        
+        # Test database connection
+        connection_test = config.test_connection()
+        health_status["database_connection"] = connection_test
+        
+        # Test OpenAI connection
+        embeddings = config.embeddings
+        health_status["openai_connection"] = True
+        
+        overall_health = all([
+            health_status["langchain_config"],
+            health_status["database_connection"],
+            health_status["openai_connection"]
+        ])
+        
+        return APIResponse(
+            success=overall_health,
+            message="RAG system health check completed",
+            data=health_status
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ RAG health check failed: {e}")
+        health_status["errors"].append(str(e))
+        
+        return APIResponse(
+            success=False,
+            message="RAG system health check failed",
+            data=health_status
+        )
+
+# ==========================================
 # Root endpoint
 # ==========================================
 
@@ -605,6 +758,9 @@ async def root():
             "docs": "/docs",
             "transcripts": "/transcripts/",
             "search": "/search",
+            "rag": "/rag/basic",
+            "rag_test": "/rag/test",
+            "rag_health": "/rag/health",
             "metadata": "/metadata/{video_id}",
             "status": "/metadata-status"
         }

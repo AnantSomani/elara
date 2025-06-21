@@ -1,33 +1,38 @@
 # Core FastAPI dependencies
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
 
 # YouTube transcript fetching
-youtube-transcript-api==0.6.2
+youtube-transcript-api>=0.6.2
 
-# Data validation and parsing (compatible with Python 3.13)
-pydantic==2.5.0
+# Data validation and parsing - compatible with LangChain 0.3.x
+pydantic>=2.7.4,<3.0.0
 
 # HTTP client for external requests
-requests==2.31.0
-httpx==0.25.2
+requests>=2.31.0
+httpx>=0.26.0
 
 # Environment and configuration
-python-dotenv==1.0.0
+python-dotenv>=1.0.0
 
 # File upload support
-python-multipart==0.0.6
+python-multipart>=0.0.6
 
 # Database dependencies
-asyncpg==0.29.0
-supabase==2.8.1
+asyncpg>=0.29.0
+supabase>=2.8.0
 sqlalchemy>=2.0.25
 
 # AI/ML dependencies for embeddings
-openai>=1.12.0
-numpy>=1.24.0
+openai>=1.40.0
+numpy>=1.26.0,<2.0.0
 
 # Development and testing (optional)
-pytest==7.4.3
-pytest-asyncio==0.21.1
-isodate==0.6.1
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+isodate>=0.6.0
+
+# LangChain RAG dependencies (Phase 1) - latest versions
+langchain>=0.3.26
+langchain-openai>=0.2.0
+# Note: Using custom vector store with existing psycopg2 instead of langchain-postgres
