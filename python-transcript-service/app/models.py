@@ -204,6 +204,7 @@ class RAGMetadata(BaseModel):
     retrieval_method: str = Field(..., description="Type of retrieval used (semantic, hybrid, etc.)")
     request_id: str = Field(..., description="Unique request identifier")
     error: Optional[str] = Field(None, description="Error message if query failed")
+    pipeline_attribution: Optional[Dict[str, Any]] = Field(None, description="RAG pipeline attribution details")
 
 class RAGResponse(BaseModel):
     """Response model for RAG queries"""
