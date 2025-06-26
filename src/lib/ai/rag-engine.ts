@@ -778,6 +778,62 @@ export function analyzeQuestionForRAG(question: string): {
 }
 
 /**
+ * Enhanced question analysis that integrates Haiku intent detection
+ */
+export function analyzeQuestionWithIntent(
+  question: string, 
+  haikuResult?: { intent: string; confidence: number; requiresRealTime: boolean; shouldUseRewritten: boolean }
+): {
+  searchStrategy: 'semantic' | 'keyword' | 'hybrid';
+  contentTypes: ('episode' | 'transcript' | 'personality' | 'conversation')[];
+  temporalScope: 'current' | 'episode' | 'historical';
+  detectedIntent?: string;
+  confidenceSource: 'haiku' | 'pattern_matching';
+  requiresRealTime?: boolean;
+} {
+  
+  const baseAnalysis = analyzeQuestionForRAG(question);
+  
+  if (haikuResult && haikuResult.confidence > 0.7) {
+    console.log(`🧠 Using Haiku intent analysis: ${haikuResult.intent} (confidence: ${haikuResult.confidence})`);
+    
+    // Map Haiku intents to search strategies
+    let searchStrategy = baseAnalysis.searchStrategy;
+    if (haikuResult.intent === 'find_quote') {
+      searchStrategy = 'keyword';
+    } else if (haikuResult.intent === 'compare') {
+      searchStrategy = 'hybrid';
+    } else if (['summarize', 'get_opinion', 'episode_content'].includes(haikuResult.intent)) {
+      searchStrategy = 'semantic';
+    }
+    
+    // Map intents to content types
+    let contentTypes = [...baseAnalysis.contentTypes];
+    if (haikuResult.intent === 'get_opinion') {
+      contentTypes.push('personality');
+    }
+    if (haikuResult.intent === 'episode_content') {
+      contentTypes = ['episode', 'transcript'];
+    }
+    
+    return {
+      ...baseAnalysis,
+      searchStrategy,
+      contentTypes: [...new Set(contentTypes)], // Remove duplicates
+      detectedIntent: haikuResult.intent,
+      confidenceSource: 'haiku',
+      requiresRealTime: haikuResult.requiresRealTime
+    };
+  }
+  
+  console.log(`📊 Using pattern matching analysis (no high-confidence Haiku result)`);
+  return { 
+    ...baseAnalysis, 
+    confidenceSource: 'pattern_matching' as const
+  };
+}
+
+/**
  * Extract guest information from episode title and description
  */
 async function extractGuestContext(episodeTitle: string, episodeDescription?: string): Promise<GuestContext | undefined> {

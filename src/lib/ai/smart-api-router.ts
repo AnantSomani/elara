@@ -98,6 +98,74 @@ class SmartAPIRouter {
   }
 
   /**
+   * Enhanced API decision with Haiku intent awareness
+   */
+  async shouldUseAPIWithIntent(
+    question: string,
+    detectedIntent: string,
+    haikuConfidence: number,
+    localRAGResults: any[] = [],
+    episodeContext?: any
+  ): Promise<APIDecision & { detectedIntent: string }> {
+    
+    console.log(`🤖 Smart Router with Intent analyzing: "${question}"`);
+    console.log(`🧠 Haiku detected intent: ${detectedIntent} (confidence: ${haikuConfidence})`);
+    
+    // Get base decision from existing logic
+    const baseDecision = await this.shouldUseAPI(question, localRAGResults, episodeContext);
+    
+    // Intent-based overrides (only for high confidence)
+    if (haikuConfidence > 0.8) {
+      // Force real-time for these intents
+      if (['current_info', 'fact_check'].includes(detectedIntent)) {
+        console.log(`🔄 Intent override: ${detectedIntent} requires real-time data`);
+        return {
+          ...baseDecision,
+          useAPI: true,
+          priority: 'api_only' as const,
+          reasoning: `${baseDecision.reasoning} + High-confidence intent: ${detectedIntent}`,
+          confidence: Math.max(baseDecision.confidence, 0.8),
+          detectedIntent
+        };
+      }
+      
+      // Force local-only for these intents
+      if (['summarize', 'find_quote', 'get_opinion', 'episode_content'].includes(detectedIntent)) {
+        console.log(`🏠 Intent override: ${detectedIntent} should use local content`);
+        return {
+          ...baseDecision,
+          useAPI: false,
+          priority: 'local_only' as const,
+          reasoning: `${baseDecision.reasoning} + High-confidence local intent: ${detectedIntent}`,
+          confidence: Math.max(baseDecision.confidence, 0.8),
+          detectedIntent
+        };
+      }
+      
+      // Compare intent suggests hybrid approach
+      if (detectedIntent === 'compare') {
+        console.log(`⚖️ Intent override: ${detectedIntent} may benefit from hybrid approach`);
+        return {
+          ...baseDecision,
+          useAPI: baseDecision.useAPI, // Keep base decision but boost confidence
+          priority: 'hybrid' as const,
+          reasoning: `${baseDecision.reasoning} + Intent: ${detectedIntent} (comparison may benefit from multiple sources)`,
+          confidence: Math.max(baseDecision.confidence, 0.7),
+          detectedIntent
+        };
+      }
+    }
+    
+    // For lower confidence, enhance the reasoning but don't override
+    console.log(`📊 Using base router decision with intent context`);
+    return { 
+      ...baseDecision, 
+      reasoning: `${baseDecision.reasoning} + Intent: ${detectedIntent} (confidence: ${haikuConfidence.toFixed(2)})`,
+      detectedIntent 
+    };
+  }
+
+  /**
    * Analyze question to understand intent, temporal context, and requirements
    */
   private analyzeQuestion(question: string): QuestionAnalysis {

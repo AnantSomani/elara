@@ -24,6 +24,7 @@
     "tactiq:stats": "curl 'http://localhost:8080/api/ask?action=system_stats'"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.55.0",
     "@heroicons/react": "^2.2.0",
     "@langchain/openai": "^0.5.11",
     "@playwright/test": "^1.53.0",

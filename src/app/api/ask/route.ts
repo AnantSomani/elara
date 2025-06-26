@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { hybridSearchTranscriptChunks, getAllChunksForVideo, getVideoSearchStats } from '@/lib/supabase/searchChunks';
 import { generateAnswer, estimateAnswerCost, validateContextLength } from '@/lib/openai/generateAnswer';
 import { supabaseAdmin } from '@/lib/database/supabase';
+import { haikuRewriter } from '@/lib/ai/query-rewriter';
 
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
@@ -13,7 +14,8 @@ export async function POST(request: NextRequest) {
       question,
       search_options = {},
       generation_options = {},
-      include_context = false 
+      include_context = false,
+      enable_haiku_rewriting = true  // New option
     } = body;
     
     // Validate input
@@ -54,12 +56,43 @@ export async function POST(request: NextRequest) {
 
     // Get video metadata for better context
     const videoMetadata = await getVideoMetadata(video_id);
+    let finalQuestion = question;
+    let rewriteMetadata = null;
 
-    // Search transcript chunks using hybrid approach
+    // HAIKU QUERY REWRITING (MVP)
+    if (enable_haiku_rewriting) {
+      try {
+        console.log('🤖 Rewriting query with Haiku...');
+        
+        const rewriteResult = await haikuRewriter.rewriteQuery(question, {
+          episodeTitle: videoMetadata?.title,
+          channelTitle: videoMetadata?.channel_title,
+          speakers: extractSpeakersFromTitle(videoMetadata?.title) // Simple extraction
+        });
+
+        if (rewriteResult.shouldUseRewritten) {
+          finalQuestion = rewriteResult.rewrittenQuery;
+          console.log(`📝 Using rewritten query: "${finalQuestion}"`);
+        }
+
+        rewriteMetadata = {
+          original: question,
+          rewritten: rewriteResult.rewrittenQuery,
+          intent: rewriteResult.intent,
+          confidence: rewriteResult.confidence,
+          used_rewritten: rewriteResult.shouldUseRewritten,
+          processing_time_ms: rewriteResult.processingTimeMs
+        };
+      } catch (error) {
+        console.warn('Haiku rewriting failed, continuing with original query:', error);
+      }
+    }
+
+    // Search transcript chunks using hybrid approach (now with potentially rewritten query)
     console.log('🔍 Searching transcript chunks...');
     const searchResult = await hybridSearchTranscriptChunks(
       video_id,
-      question,
+      finalQuestion,  // ← This is now potentially rewritten
       {
         limit: search_options.limit || 5,
         includeWordCount: true,
@@ -134,13 +167,14 @@ export async function POST(request: NextRequest) {
 
     console.log(`✅ Generated answer in ${totalProcessingTime}ms (${answerResult.usage.totalTokens} tokens, ~$${estimatedCost.toFixed(6)})`);
 
-    // Prepare response
+    // Prepare response (enhanced with rewrite metadata)
     const response: any = {
       success: true,
       data: {
         answer: answerResult.answer,
         video_id,
-        question,
+        question: finalQuestion,  // Return the final question used
+        original_question: question,  // Keep original for reference
         search_metadata: {
           method: searchMethod,
           chunks_searched: chunksUsed,
@@ -158,6 +192,7 @@ export async function POST(request: NextRequest) {
           estimated_cost_usd: estimatedCost,
           processing_time_ms: totalProcessingTime
         },
+        query_rewrite_metadata: rewriteMetadata,  // ← New field
         video_metadata: {
           ...videoMetadata,
           ...videoStats
@@ -220,6 +255,29 @@ async function getVideoMetadata(videoId: string): Promise<{
     console.warn('Could not fetch video metadata:', error);
     return null;
   }
+}
+
+/**
+ * Helper function to extract speakers from title (simple version)
+ */
+function extractSpeakersFromTitle(title?: string): string {
+  if (!title) return 'Unknown';
+  
+  // Simple patterns to extract names
+  const patterns = [
+    /with ([A-Z][a-z]+ [A-Z][a-z]+)/,
+    /ft\.? ([A-Z][a-z]+ [A-Z][a-z]+)/,
+    /featuring ([A-Z][a-z]+ [A-Z][a-z]+)/,
+    /([A-Z][a-z]+ [A-Z][a-z]+) - /,
+    /([A-Z][a-z]+ [A-Z][a-z]+):/
+  ];
+  
+  for (const pattern of patterns) {
+    const match = title.match(pattern);
+    if (match) return match[1];
+  }
+  
+  return 'Host';
 }
 
 /**
