@@ -23,6 +23,8 @@ export default function YouTubeChatWindow({
   const [isLoading, setIsLoading] = useState(false)
   const [transcriptAvailable, setTranscriptAvailable] = useState<boolean | null>(null)
   const [sessionCost, setSessionCost] = useState(0)
+  const [sessionId, setSessionId] = useState<string>('')
+  const [conversationHistory, setConversationHistory] = useState<YouTubeChatMessage[]>([])
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const voiceControlsRef = useRef<VoiceControlsRef>(null)
 
@@ -35,9 +37,69 @@ export default function YouTubeChatWindow({
   }, [messages])
 
   useEffect(() => {
+    // Generate unique session ID for this video chat
+    const newSessionId = `${videoId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+    setSessionId(newSessionId)
+    console.log(`💾 [SESSION] Created session: ${newSessionId}`)
+    
+    // Try to restore conversation from localStorage
+    const savedChatKey = `elara-chat-${videoId}`
+    const saved = localStorage.getItem(savedChatKey)
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved)
+        // Validate the data structure
+        if (parsed.messages && Array.isArray(parsed.messages)) {
+          console.log(`💾 [SESSION] Restoring ${parsed.messages.length} messages from localStorage`)
+          
+          // Restore messages with proper Date objects
+          const restoredMessages = parsed.messages.map((msg: any) => ({
+            ...msg,
+            timestamp: new Date(msg.timestamp)
+          }))
+          
+          setMessages(restoredMessages)
+          setConversationHistory(restoredMessages)
+          
+          // Restore session cost if available
+          if (parsed.sessionCost) {
+            setSessionCost(parsed.sessionCost)
+          }
+        }
+      } catch (e) {
+        console.warn('💾 [SESSION] Could not restore chat history:', e)
+        // Clear corrupted data
+        localStorage.removeItem(savedChatKey)
+      }
+    }
+  }, [videoId])
+
+  useEffect(() => {
     // Check transcript availability when component mounts
     checkTranscriptAvailability()
   }, [videoId])
+
+  // 🧠 Phase 1.2: Message persistence to localStorage
+  useEffect(() => {
+    if (messages.length > 0 && sessionId) {
+      const chatData = {
+        sessionId,
+        messages,
+        sessionCost,
+        timestamp: Date.now(),
+        videoId,
+        videoTitle
+      }
+      
+      const savedChatKey = `elara-chat-${videoId}`
+      localStorage.setItem(savedChatKey, JSON.stringify(chatData))
+      
+      // Update conversation history for backend
+      setConversationHistory(messages)
+      
+      console.log(`💾 [SESSION] Saved ${messages.length} messages to localStorage`)
+    }
+  }, [messages, sessionId, sessionCost, videoId, videoTitle])
 
   const checkTranscriptAvailability = async () => {
     try {
@@ -81,6 +143,8 @@ export default function YouTubeChatWindow({
         body: JSON.stringify({
           question: textToSend,
           videoId: videoId,
+          sessionId: sessionId,
+          conversationHistory: conversationHistory.slice(-6),
           context: {
             videoTitle,
             channelTitle,
@@ -89,6 +153,8 @@ export default function YouTubeChatWindow({
           }
         }),
       })
+
+      console.log(`🧠 [SESSION] Sent message with sessionId: ${sessionId}, history: ${conversationHistory.length} messages`)
 
       const data = await response.json()
       

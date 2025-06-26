@@ -178,14 +178,23 @@ class TranscriptRequest(BaseModel):
     language: Optional[str] = None
 
 # ==========================================
-# RAG Models (Phase 1)
+# RAG Models (Phase 1 + Phase 2 Memory)
 # ==========================================
 
+class ConversationMessage(BaseModel):
+    """Individual message in conversation history"""
+    role: str = Field(..., description="Message role: 'user' or 'assistant'")
+    content: str = Field(..., description="Message content")
+    timestamp: Optional[str] = Field(None, description="Message timestamp")
+
 class RAGRequest(BaseModel):
-    """Request model for RAG queries"""
+    """Request model for RAG queries with conversation memory support"""
     query: str = Field(..., description="User question or query", min_length=1, max_length=1000)
     video_id: Optional[str] = Field(None, description="Optional filter by specific video ID")
     top_k: int = Field(5, description="Number of relevant chunks to retrieve", ge=1, le=20)
+    # 🧠 Phase 2.3: Add session parameters for memory
+    session_id: Optional[str] = Field(None, description="Session ID for conversation memory")
+    conversation_history: Optional[List[ConversationMessage]] = Field(None, description="Previous conversation messages")
 
 class RAGSourceDocument(BaseModel):
     """Source document information in RAG response"""
@@ -205,6 +214,10 @@ class RAGMetadata(BaseModel):
     request_id: str = Field(..., description="Unique request identifier")
     error: Optional[str] = Field(None, description="Error message if query failed")
     pipeline_attribution: Optional[Dict[str, Any]] = Field(None, description="RAG pipeline attribution details")
+    # 🧠 Phase 2.3: Add memory metadata
+    memory_used: Optional[bool] = Field(None, description="Whether conversation memory was used")
+    memory_context_length: Optional[int] = Field(None, description="Length of memory context in characters")
+    session_id: Optional[str] = Field(None, description="Session ID used for memory")
 
 class RAGResponse(BaseModel):
     """Response model for RAG queries"""

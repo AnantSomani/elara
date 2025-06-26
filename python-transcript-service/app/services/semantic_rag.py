@@ -1,6 +1,7 @@
 """
-Semantic RAG Service for Phase 1
+Semantic RAG Service for Phase 1 + Phase 2 Memory
 Uses LangChain to perform semantic search on existing youtube_transcript_chunks
+Now includes ConversationSummaryBufferMemory for chat sessions
 """
 
 import logging
@@ -8,41 +9,289 @@ import time
 import requests
 import os
 import json
+import psycopg2
+import re
 from typing import List, Dict, Any, Optional
 from uuid import uuid4
 
 from langchain.chains import RetrievalQA
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
+from langchain.memory import ConversationSummaryBufferMemory
+from langchain_core.messages import HumanMessage, AIMessage
 
 from .langchain_config import get_langchain_config
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
+def has_pronouns_or_references(question: str) -> bool:
+    """
+    Detect if query contains pronouns or ambiguous references that need resolution
+    
+    Args:
+        question: User's question to analyze
+        
+    Returns:
+        bool: True if query contains pronouns or references that should be resolved
+    """
+    # Personal pronouns that need resolution
+    pronouns = [
+        'he', 'she', 'they', 'it', 'him', 'her', 'them', 
+        'his', 'hers', 'their', 'its', 'himself', 'herself', 
+        'themselves', 'itself'
+    ]
+    
+    # Ambiguous references that may need clarification
+    references = [
+        'this', 'that', 'these', 'those', 'the above', 'the mentioned',
+        'the person', 'the company', 'the organization', 'the topic',
+        'the concept', 'the idea', 'the solution', 'the problem'
+    ]
+    
+    question_lower = question.lower().strip()
+    question_words = question_lower.split()
+    
+    # Strip punctuation from words for accurate matching
+    clean_words = [re.sub(r'[^\w]', '', word) for word in question_words]
+    
+    # Check for direct pronoun matches (whole words only)
+    for pronoun in pronouns:
+        if pronoun in clean_words:
+            return True
+    
+    # Check for reference phrases
+    for reference in references:
+        if reference in question_lower:
+            return True
+    
+    # Special patterns that often need resolution
+    ambiguous_patterns = [
+        'what about',      # "What about him?"
+        'how does',        # "How does this affect them?"
+        'why is',          # "Why is that important?"
+        'what makes',      # "What makes them different?"
+        'how can',         # "How can they improve?"
+    ]
+    
+    for pattern in ambiguous_patterns:
+        if pattern in question_lower:
+            # Check if the pattern is followed by pronouns or references
+            pattern_followed_by_pronoun = any(p in clean_words for p in pronouns + ['this', 'that', 'these', 'those'])
+            if pattern_followed_by_pronoun:
+                return True
+    
+    return False
+
+def resolve_query_references(question: str, conversation_memory: str, llm) -> str:
+    """
+    Resolve pronouns and ambiguous references in a query using conversation memory
+    
+    Args:
+        question: Original question with pronouns/references
+        conversation_memory: Conversation context from memory
+        llm: Language model instance for resolution
+        
+    Returns:
+        str: Resolved question with pronouns replaced by specific entities
+    """
+    # If no memory context, return original question
+    if not conversation_memory or conversation_memory.strip() == "":
+        return question
+    
+    resolution_prompt = f"""You are helping resolve ambiguous references in a user's question based on previous conversation context.
+
+CONVERSATION CONTEXT:
+{conversation_memory}
+
+CURRENT QUESTION: "{question}"
+
+CRITICAL INSTRUCTION: When multiple people of the same gender are mentioned, you MUST choose the MOST RECENTLY mentioned person, even if another person seems more topically relevant.
+
+EXAMPLE SCENARIO:
+- If the conversation mentions "John works at Tesla" then "Mary works at Google" 
+- Then the question is "What does she think about electric cars?"
+- You MUST resolve to Mary (most recent woman), NOT John (even though Tesla is more relevant to electric cars)
+
+Your task: Rewrite the question to replace pronouns and ambiguous references with specific entities from the conversation context.
+
+RULES (IN ORDER OF PRIORITY):
+1. RECENCY FIRST: Always choose the most recently mentioned person of that gender
+2. IGNORE topic relevance when resolving pronouns  
+3. IGNORE semantic similarity when resolving pronouns
+4. Replace pronouns (he/she/they/him/her/them/it/his/her) with the specific person/entity they refer to
+5. Replace ambiguous references (this/that/the person/the company) with specific names
+6. Keep the original question structure and intent
+7. If you cannot determine what a pronoun refers to, leave it unchanged
+8. Only use information explicitly mentioned in the conversation context
+9. Return ONLY the resolved question, no explanations
+
+CRITICAL: Look at the conversation chronologically. The LAST person mentioned of each gender is the referent for pronouns of that gender, regardless of how well they match the topic.
+
+Resolved question:"""
+
+    try:
+        # Get resolution from LLM
+        response = llm.invoke(resolution_prompt)
+        resolved_question = response.content.strip()
+        
+        # Basic validation - ensure we got a reasonable response
+        if (resolved_question and 
+            len(resolved_question) > 0 and 
+            len(resolved_question) < len(question) * 3 and  # Not too long
+            not resolved_question.startswith("I ") and      # Not an explanation
+            not resolved_question.startswith("The ") and    # Not starting with "The resolved..."
+            "?" in resolved_question):                       # Still a question
+            
+            logger.info(f"Query resolution: '{question}' → '{resolved_question}'")
+            return resolved_question
+        else:
+            logger.warning(f"Invalid resolution response, using original question: {resolved_question}")
+            return question
+            
+    except Exception as e:
+        logger.error(f"Error resolving query references: {e}")
+        return question
+
 class SemanticRAGService:
     """
     Semantic RAG service using LangChain + existing PostgreSQL setup
     Creates fresh instances per request to avoid memory leaks
+    🧠 Phase 2.2: Now includes session-based conversation memory
     """
     
     def __init__(self):
         self.request_id = str(uuid4())[:8]
-        logger.info(f"🚀 [REQ:{self.request_id}] SemanticRAGService initialized")
+        self.memory_store = {}  # Dict[session_id, ConversationSummaryBufferMemory]
+        logger.info(f"🚀 [REQ:{self.request_id}] SemanticRAGService initialized with memory support")
+    
+    def _is_summarization_query(self, question: str) -> bool:
+        """
+        Detect if the query is asking for a summary/overview of the content
+        
+        Args:
+            question: User's question
+            
+        Returns:
+            bool: True if this is a summarization query
+        """
+        question_lower = question.lower().strip()
+        
+        # Direct summarization keywords
+        summarization_keywords = [
+            'summarize', 'summary', 'overview', 'what is this about',
+            'main points', 'key points', 'main topics', 'key topics',
+            'what does this cover', 'what is covered', 'content summary',
+            'brief overview', 'quick summary', 'tldr', 'tl;dr',
+            'what happened', 'what did they talk about', 'what is discussed',
+            'main ideas', 'key ideas', 'central themes', 'core concepts'
+        ]
+        
+        # Check for direct matches
+        for keyword in summarization_keywords:
+            if keyword in question_lower:
+                logger.info(f"📋 [SUMMARIZATION] Detected keyword: '{keyword}'")
+                return True
+        
+        # Check for common summarization patterns
+        summarization_patterns = [
+            'what is this video about',
+            'what is this podcast about', 
+            'what does this video discuss',
+            'what does this podcast discuss',
+            'what are the main',
+            'what are the key',
+            'can you summarize',
+            'give me a summary'
+        ]
+        
+        for pattern in summarization_patterns:
+            if pattern in question_lower:
+                logger.info(f"📋 [SUMMARIZATION] Detected pattern: '{pattern}'")
+                return True
+        
+        return False
+    
+    def _fetch_full_transcript_direct(self, video_id: str) -> Optional[Document]:
+        """
+        Directly fetch the full transcript from database without any search
+        
+        Args:
+            video_id: YouTube video ID
+            
+        Returns:
+            Document with full transcript or None if not found
+        """
+        try:
+            # Get database connection (reuse existing config)
+            config = get_langchain_config()
+            
+            # Build connection string like langchain_config does
+            supabase_url = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+            db_password = os.getenv("SUPABASE_DB_PASSWORD")
+            supabase_url_clean = supabase_url.replace('https://', '')
+            project_id = supabase_url_clean.split('.')[0]
+            connection_string = f"postgresql://postgres:{db_password}@db.{project_id}.supabase.co:5432/postgres"
+            
+            with psycopg2.connect(connection_string) as conn:
+                with conn.cursor() as cur:
+                    # Simple direct query - no FTS, no search complexity
+                    cur.execute("""
+                        SELECT 
+                            content,
+                            video_id,
+                            segment_count,
+                            total_duration
+                        FROM youtube_transcripts 
+                        WHERE video_id = %s
+                        LIMIT 1
+                    """, (video_id,))
+                    
+                    result = cur.fetchone()
+                    
+                    if result:
+                        content, vid_id, segment_count, duration = result
+                        
+                        logger.info(f"📋 [DIRECT-TRANSCRIPT] Found transcript for {video_id}: {len(content)} chars, {segment_count} segments")
+                        
+                        # Create document with full transcript
+                        doc = Document(
+                            page_content=content,
+                            metadata={
+                                "video_id": vid_id,
+                                "source_type": "full_transcript_direct",
+                                "segment_count": segment_count,
+                                "total_duration": float(duration) if duration else None,
+                                "search_method": "direct_fetch"
+                            }
+                        )
+                        return doc
+                    else:
+                        logger.warning(f"📋 [DIRECT-TRANSCRIPT] No transcript found for video {video_id}")
+                        return None
+                        
+        except Exception as e:
+            logger.error(f"❌ [DIRECT-TRANSCRIPT] Error fetching transcript for {video_id}: {e}")
+            return None
     
     async def query(
         self, 
         question: str, 
         video_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        conversation_history: Optional[List[Dict]] = None,
         top_k: int = 5,
         performance_mode: str = "balanced"
     ) -> Dict[str, Any]:
         """
-        Perform semantic RAG query on existing transcript chunks with adaptive model selection
+        Perform semantic RAG query with streamlined summarization support
+        🧠 Phase 2.2: Now includes conversation memory for contextual responses
         
         Args:
             question: User's question
             video_id: Optional filter by specific video
+            session_id: Optional session ID for conversation memory
+            conversation_history: Optional list of previous messages for context
             top_k: Number of relevant chunks to retrieve
             performance_mode: "speed", "quality", or "balanced" for model selection
             
@@ -54,6 +303,8 @@ class SemanticRAGService:
         logger.info(f"🔍 [REQ:{self.request_id}] Semantic query: '{question[:100]}...'")
         if video_id:
             logger.info(f"📹 [REQ:{self.request_id}] Filtering by video: {video_id}")
+        if session_id:
+            logger.info(f"💾 [REQ:{self.request_id}] Session: {session_id}, History: {len(conversation_history or [])} messages")
         
         try:
             # Initialize attribution tracking
@@ -67,13 +318,117 @@ class SemanticRAGService:
                 'context_composition': {}
             }
             
-            # Get LangChain config with our simple setup
+            # Get LangChain config - needed for all flows
             config = get_langchain_config()
-            vector_store = config.vector_store
             
-            # Perform hybrid search (FTS + semantic)
-            logger.info(f"🔍 [REQ:{self.request_id}] Performing hybrid search...")
-            relevant_docs = vector_store.hybrid_search(question, video_id=video_id)
+            # Select optimal LLM model (initial selection, may be refined later)
+            llm, model_info = config.get_adaptive_llm("", question, performance_mode)
+            
+            # 🧠 Phase 2.2: Initialize/get memory for this session EARLY (needed for pronoun resolution)
+            memory = None
+            memory_context = ""
+            db_session_id = None
+            if session_id:
+                # 🧠 Phase 2.4: Create/retrieve database session
+                db_session_id = await self._get_or_create_db_session(session_id, video_id)
+                
+                memory = self._get_or_create_memory(session_id, llm)
+                
+                # Add conversation history to memory if provided
+                if conversation_history:
+                    for msg in conversation_history[-4:]:  # Last 2 exchanges to avoid overwhelming context
+                        try:
+                            if msg['role'] == 'user':
+                                memory.chat_memory.add_user_message(msg['content'])
+                            elif msg['role'] == 'assistant':
+                                memory.chat_memory.add_ai_message(msg['content'])
+                        except Exception as e:
+                            logger.warning(f"⚠️ [MEMORY] Could not add message to memory: {e}")
+                
+                # Retrieve memory context for this query
+                try:
+                    memory_buffer = memory.buffer
+                    # Ensure memory_context is always a string
+                    if isinstance(memory_buffer, list):
+                        # If buffer returns a list of messages, join them
+                        memory_context = "\n".join(str(msg) for msg in memory_buffer)
+                    else:
+                        memory_context = str(memory_buffer) if memory_buffer else ""
+                    
+                    # 🔧 NEW: Enhance memory context with explicit chronological markers for better pronoun resolution
+                    if memory_context and has_pronouns_or_references(question):
+                        # Parse the conversation and add numbered chronology
+                        lines = memory_context.split('\n')
+                        numbered_context = []
+                        conversation_order = 1
+                        
+                        for line in lines:
+                            if line.strip():
+                                numbered_context.append(f"[{conversation_order}] {line}")
+                                if line.startswith('Human:') or line.startswith('AI:'):
+                                    conversation_order += 1
+                        
+                        enhanced_context = f"""CONVERSATION HISTORY (NUMBERED IN CHRONOLOGICAL ORDER):
+{chr(10).join(numbered_context)}
+
+⚠️  CRITICAL FOR PRONOUN RESOLUTION: 
+- The conversation above is numbered in chronological order [1], [2], [3], etc.
+- HIGHER numbers = MORE RECENT mentions
+- When resolving pronouns like "he/she/his/her", you MUST choose the person with the HIGHEST number
+- IGNORE topic relevance - ONLY use the highest numbered mention
+- Example: If [1] mentions John and [5] mentions Mike, then "he" refers to Mike (higher number)
+- The LAST/HIGHEST numbered person of each gender wins, regardless of topic similarity."""
+                        memory_context = enhanced_context
+                    
+                    logger.info(f"💭 [MEMORY] Retrieved context: {len(memory_context)} chars")
+                except Exception as e:
+                    logger.warning(f"⚠️ [MEMORY] Could not retrieve context: {e}")
+                    memory_context = ""
+            
+            # 🔧 NEW: Step 2.1 - Pronoun Detection and Resolution
+            original_question = question
+            resolved_question = question
+            
+            # Check if question contains pronouns or ambiguous references
+            if has_pronouns_or_references(question):
+                logger.info(f"🔍 [PRONOUN-DETECTION] Question contains pronouns/references: '{question}'")
+                
+                if memory_context:
+                    # Resolve pronouns using conversation memory
+                    resolved_question = resolve_query_references(question, memory_context, llm)
+                    
+                    if resolved_question != question:
+                        logger.info(f"✨ [PRONOUN-RESOLUTION] '{question}' → '{resolved_question}'")
+                                                # Use resolved question for all subsequent searches
+                        question = resolved_question
+                    else:
+                        logger.info(f"📝 [PRONOUN-RESOLUTION] No changes made, using original question")
+                else:
+                    logger.info(f"⚠️ [PRONOUN-RESOLUTION] No memory context available, using original question")
+            else:
+                logger.info(f"✅ [PRONOUN-DETECTION] No pronouns/references detected in: '{question}'")
+            
+            # NEW: Check for summarization queries and handle them directly
+            if video_id and self._is_summarization_query(question):
+                logger.info(f"📋 [SUMMARIZATION] Direct transcript fetch for: '{question[:50]}...'")
+                
+                # Fetch full transcript directly - no search overhead
+                direct_transcript = self._fetch_full_transcript_direct(video_id)
+                
+                if direct_transcript:
+                    # Use direct transcript as the only source
+                    relevant_docs = [direct_transcript]
+                    attribution_tracker['full_transcripts'].append(direct_transcript)
+                    logger.info(f"📋 [SUMMARIZATION] Using direct transcript: {len(direct_transcript.page_content)} chars")
+                else:
+                    # Fallback to external search if no transcript found
+                    logger.warning(f"📋 [SUMMARIZATION] No transcript found, falling back to external search")
+                    relevant_docs = []
+            else:
+                # Standard flow: Perform hybrid search (FTS + semantic)
+                vector_store = config.vector_store
+                logger.info(f"🔍 [REQ:{self.request_id}] Performing hybrid search...")
+                relevant_docs = vector_store.hybrid_search(question, video_id=video_id)
             
             # Track document types for attribution
             for doc in relevant_docs:
@@ -81,7 +436,7 @@ class SemanticRAGService:
                 if source_type == 'chunk':
                     attribution_tracker['transcript_chunks'].append(doc)
                     attribution_tracker['semantic_similarities'].append(doc.metadata.get('similarity', 0))
-                elif source_type == 'full_transcript':
+                elif source_type in ['full_transcript', 'full_transcript_direct']:
                     attribution_tracker['full_transcripts'].append(doc)
             
             # NEW: Check if external search is needed
@@ -136,13 +491,12 @@ class SemanticRAGService:
                     'external_percentage': round((external_content_length / total_content_length) * 100, 1) if total_content_length > 0 else 0
                 }
             
-            # Select optimal LLM model based on context and query
-            llm, model_info = config.get_adaptive_llm(context, question, performance_mode)
-            
             # Create prompt (clean, no source references)
             if not relevant_docs and external_info:
                 # Prompt for external-only context
                 prompt_text = f"""You are Elara, an AI assistant that provides helpful and accurate information.
+
+{f"Previous conversation context: {memory_context}" if memory_context else ""}
 
 I found relevant information from web sources to help answer your question:
 
@@ -151,10 +505,12 @@ Content:
 
 Question: {question}
 
-Answer the question based on the information above. Be conversational, helpful, and concise. Provide a clear and accurate response."""
+Answer the question based on the information above and previous conversation if relevant. Be conversational, helpful, and concise. Provide a clear and accurate response."""
             else:
                 # Standard prompt for transcript + external context
-                prompt_text = f"""You are Elara, an AI assistant that helps users understand YouTube video content.
+                prompt_text = f"""You are Elara, an AI assistant that helps users understand YouTube video and podcast content.
+
+{f"Previous conversation context: {memory_context}" if memory_context else ""}
 
 You have access to both the complete transcript and the most relevant sections based on the user's question. Use this information to provide a clear, helpful response.
 
@@ -163,7 +519,7 @@ Content:
 
 Question: {question}
 
-Answer based on the content above. Use the full transcript for overall context and the relevant sections for specific details. Be conversational and helpful.
+Answer based on the content above and previous conversation if relevant. Use the full transcript for overall context and the relevant sections for specific details. Be conversational and helpful. Summarize the context if necessary to sound more conversational and informative.
 
 Also, do not make long winded responses. Keep it short and concise. Make sure that you answer the question to the best of your ability. Do not talk about a transcript or source, but instead the content or podcast, depending on what the format is. Also, use outside knowledge that is unrelated to the prompt if necessary."""
             
@@ -189,6 +545,21 @@ Also, do not make long winded responses. Keep it short and concise. Make sure th
                 sources.append(source_info)
             
             processing_time_ms = int((time.time() - start_time) * 1000)
+            
+            # 🧠 Phase 2.2: Save current exchange to memory after getting response
+            if memory and session_id:
+                try:
+                    # Save the ORIGINAL question (what user actually asked) to memory
+                    memory.chat_memory.add_user_message(original_question)
+                    memory.chat_memory.add_ai_message(answer)
+                    logger.info(f"💾 [MEMORY] Saved exchange to session: {session_id}")
+                    
+                    # 🧠 Phase 2.4: Save to database as well (also using original question)
+                    await self._save_message_to_db(db_session_id, "user", original_question)
+                    await self._save_message_to_db(db_session_id, "assistant", answer, processing_time_ms)
+                    logger.info(f"🗄️ [DB] Saved messages to database session: {db_session_id}")
+                except Exception as e:
+                    logger.warning(f"⚠️ [MEMORY] Could not save to memory/database: {e}")
             
             # Enhanced performance logging
             logger.info(f"✅ [REQ:{self.request_id}] Query completed in {processing_time_ms}ms")
@@ -226,6 +597,17 @@ Also, do not make long winded responses. Keep it short and concise. Make sure th
                 "llm_time_ms": round(llm_time, 2),
                 "model_selection": model_info
             }
+            
+            # 🔧 NEW: Add pronoun resolution metadata EARLY
+            pronoun_resolution_used = original_question != resolved_question
+            response_metadata["pronoun_resolution"] = {
+                "used": pronoun_resolution_used,
+                "original_question": original_question,
+                "resolved_question": resolved_question if pronoun_resolution_used else None,
+                "had_pronouns": has_pronouns_or_references(original_question),
+                "memory_available": bool(memory_context)
+            }
+            logger.info(f"🔧 [DEBUG] Pronoun resolution metadata added: used={pronoun_resolution_used}, had_pronouns={has_pronouns_or_references(original_question)}")
             
             # NEW: Add external search metrics
             external_search_triggered = self._needs_external_search(question, relevant_docs)
@@ -266,6 +648,20 @@ Also, do not make long winded responses. Keep it short and concise. Make sure th
                     }
                 })
             
+            # 🧠 Phase 2.4: Add memory metadata if session was used
+            if session_id and memory:
+                response_metadata.update({
+                    "memory_used": True,
+                    "memory_context_length": len(memory_context),
+                    "session_id": session_id
+                })
+            else:
+                response_metadata.update({
+                    "memory_used": False,
+                    "memory_context_length": 0,
+                    "session_id": None
+                })
+            
             return {
                 "answer": answer,
                 "sources": sources,
@@ -288,6 +684,155 @@ Also, do not make long winded responses. Keep it short and concise. Make sure th
                     "error": str(e)
                 }
             }
+    
+    def _get_or_create_memory(self, session_id: str, llm) -> ConversationSummaryBufferMemory:
+        """
+        Get or create conversation memory for a specific session
+        
+        Args:
+            session_id: Unique session identifier
+            llm: LangChain LLM instance for summarization
+            
+        Returns:
+            ConversationSummaryBufferMemory instance for the session
+        """
+        if session_id not in self.memory_store:
+            self.memory_store[session_id] = ConversationSummaryBufferMemory(
+                llm=llm,
+                max_token_limit=1500,  # Keep context manageable - summarize when exceeded
+                return_messages=True,
+                memory_key="chat_history"
+            )
+            logger.info(f"💾 [MEMORY] Created new memory for session: {session_id}")
+        else:
+            logger.info(f"💾 [MEMORY] Retrieved existing memory for session: {session_id}")
+        
+        return self.memory_store[session_id]
+    
+    async def _get_or_create_db_session(self, session_id: str, video_id: str) -> str:
+        """
+        Get or create database session for conversation tracking
+        
+        Args:
+            session_id: Frontend session ID
+            video_id: YouTube video ID
+            
+        Returns:
+            str: Database session UUID
+        """
+        try:
+            # Try to find existing session by session_token
+            # Use Supabase connection like the rest of the app
+            supabase_url = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+            db_password = os.getenv("SUPABASE_DB_PASSWORD")
+            if supabase_url and db_password:
+                supabase_url_clean = supabase_url.replace('https://', '')
+                project_id = supabase_url_clean.split('.')[0]
+                connection_string = f"postgresql://postgres:{db_password}@db.{project_id}.supabase.co:5432/postgres"
+                connection = psycopg2.connect(connection_string)
+            else:
+                # Fallback to localhost for development
+                connection = psycopg2.connect(
+                    host='localhost',
+                    database='postgres',
+                    user='postgres',
+                    password=os.getenv('SUPABASE_DB_PASSWORD', ''),
+                    port='5432'
+                )
+            
+            cursor = connection.cursor()
+            
+            # Check if session already exists
+            cursor.execute("""
+                SELECT id FROM youtube_chat_sessions 
+                WHERE session_token = %s
+                LIMIT 1
+            """, (session_id,))
+            
+            result = cursor.fetchone()
+            
+            if result:
+                db_session_id = result[0]
+                logger.info(f"🗄️ [DB] Found existing session: {db_session_id}")
+            else:
+                # Create new session
+                cursor.execute("""
+                    INSERT INTO youtube_chat_sessions (video_id, session_token, start_time)
+                    VALUES (%s, %s, NOW())
+                    RETURNING id
+                """, (video_id, session_id))
+                
+                db_session_id = cursor.fetchone()[0]
+                connection.commit()
+                logger.info(f"🗄️ [DB] Created new session: {db_session_id}")
+            
+            cursor.close()
+            connection.close()
+            
+            return str(db_session_id)
+            
+        except Exception as e:
+            logger.warning(f"⚠️ [DB] Could not create/retrieve session: {e}")
+            return session_id  # Fallback to frontend session ID
+    
+    async def _save_message_to_db(self, db_session_id: str, message_type: str, content: str, processing_time_ms: int = 0):
+        """
+        Save message to database
+        
+        Args:
+            db_session_id: Database session UUID
+            message_type: 'user' or 'assistant'
+            content: Message content
+            processing_time_ms: Processing time for assistant messages
+        """
+        try:
+            # Use Supabase connection like the rest of the app
+            supabase_url = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+            db_password = os.getenv("SUPABASE_DB_PASSWORD")
+            if supabase_url and db_password:
+                supabase_url_clean = supabase_url.replace('https://', '')
+                project_id = supabase_url_clean.split('.')[0]
+                connection_string = f"postgresql://postgres:{db_password}@db.{project_id}.supabase.co:5432/postgres"
+                connection = psycopg2.connect(connection_string)
+            else:
+                # Fallback to localhost for development
+                connection = psycopg2.connect(
+                    host='localhost',
+                    database='postgres',
+                    user='postgres',
+                    password=os.getenv('SUPABASE_DB_PASSWORD', ''),
+                    port='5432'
+                )
+            
+            cursor = connection.cursor()
+            
+            # Insert message
+            cursor.execute("""
+                INSERT INTO youtube_chat_messages (
+                    session_id, 
+                    message_type, 
+                    content, 
+                    processing_time_ms,
+                    created_at
+                ) VALUES (%s, %s, %s, %s, NOW())
+            """, (db_session_id, message_type, content, processing_time_ms))
+            
+            # Update session message count
+            cursor.execute("""
+                UPDATE youtube_chat_sessions 
+                SET message_count = message_count + 1,
+                    updated_at = NOW()
+                WHERE id = %s
+            """, (db_session_id,))
+            
+            connection.commit()
+            cursor.close()
+            connection.close()
+            
+            logger.info(f"💬 [DB] Saved {message_type} message to session {db_session_id}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ [DB] Could not save message: {e}")
     
     def _calculate_pipeline_attribution(self, attribution_tracker: dict) -> dict:
         """

@@ -82,6 +82,20 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==========================================
+# 🧠 MEMORY FIX: Global RAG Service Instance
+# ==========================================
+# Create a global service instance to maintain memory across requests
+_global_rag_service = None
+
+def get_rag_service():
+    """Get or create the global RAG service instance for memory persistence"""
+    global _global_rag_service
+    if _global_rag_service is None:
+        _global_rag_service = create_semantic_rag_service()
+        logger.info("🧠 [MEMORY-FIX] Created global RAG service instance for memory persistence")
+    return _global_rag_service
+
+# ==========================================
 # Data Models
 # ==========================================
 
@@ -616,18 +630,37 @@ async def list_transcripts(limit: int = Query(10, ge=1, le=100)):
 async def basic_rag_query(request: RAGRequest):
     """
     Basic semantic RAG query using LangChain + existing embeddings
-    Phase 1: Pure semantic search with LLM generation
+    🧠 Phase 2.3: Now includes conversation memory support
     """
     logger.info(f"🔍 RAG query received: '{request.query[:100]}...'")
     
+    # 🧠 Phase 2.3: Log session information if provided
+    if request.session_id:
+        history_count = len(request.conversation_history) if request.conversation_history else 0
+        logger.info(f"💾 Session: {request.session_id}, History: {history_count} messages")
+    
     try:
         # Create fresh service instance to avoid memory leaks
-        rag_service = create_semantic_rag_service()
+        rag_service = get_rag_service()
         
-        # Execute query
+        # 🧠 Phase 2.3: Convert conversation history to expected format
+        conversation_history_dict = None
+        if request.conversation_history:
+            conversation_history_dict = [
+                {
+                    "role": msg.role,
+                    "content": msg.content,
+                    "timestamp": msg.timestamp
+                }
+                for msg in request.conversation_history
+            ]
+        
+        # Execute query with session data
         result = await rag_service.query(
             question=request.query,
             video_id=request.video_id,
+            session_id=request.session_id,  # 🧠 Pass session ID
+            conversation_history=conversation_history_dict,  # 🧠 Pass conversation history
             top_k=request.top_k
         )
         
@@ -647,6 +680,10 @@ async def basic_rag_query(request: RAGRequest):
             ],
             metadata=RAGMetadata(**result["metadata"])
         )
+        
+        # 🧠 Phase 2.3: Log memory usage if available
+        if response.metadata.memory_used:
+            logger.info(f"💾 Memory context used: {response.metadata.memory_context_length} chars")
         
         logger.info(f"✅ RAG query completed: {len(response.sources)} sources, {response.metadata.processing_time_ms}ms")
         return response
@@ -677,7 +714,7 @@ async def test_rag_system(test_query: str = Query("What is this video about?", d
     
     try:
         # Create fresh service instance
-        rag_service = create_semantic_rag_service()
+        rag_service = get_rag_service()
         
         # Test retrieval only (no LLM generation)
         result = await rag_service.test_retrieval(test_query)
