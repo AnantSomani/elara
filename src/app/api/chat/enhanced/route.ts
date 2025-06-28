@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { generateEnhancedRAGResponse } from '@/lib/ai/enhanced-rag-engine';
 import { analyzeQuestionForRAG } from '@/lib/ai/rag-engine';
 import { supabaseAdmin } from '@/lib/database/supabase';
+import { haikuRewriter } from '@/lib/ai/query-rewriter';
 import type { ConversationContext } from '@/types/conversation';
+import type { RewriteResult } from '@/lib/ai/query-rewriter';
 
 export async function POST(request: NextRequest) {
   try {
@@ -12,7 +14,9 @@ export async function POST(request: NextRequest) {
       episodeId = 'default',
       enableRealTimeData = true,
       maxRealTimeTools = 2,
-      hostName = 'AI Assistant'
+      hostName = 'AI Assistant',
+      conversationHistory = [],
+      enableHaikuRewriting = true
     } = body;
 
     if (!question) {
@@ -25,6 +29,36 @@ export async function POST(request: NextRequest) {
     console.log(`🚀 Enhanced RAG request: "${question}"`);
     console.log(`📺 Episode ID: ${episodeId}`);
     console.log(`📡 Real-time data enabled: ${enableRealTimeData}`);
+    console.log(`🧠 Haiku rewriting enabled: ${enableHaikuRewriting}`);
+
+    // Phase 4: Haiku Query Rewriting with Conversational Memory
+    let rewriteResult: RewriteResult | null = null;
+    let finalQuestion = question;
+    
+    if (enableHaikuRewriting) {
+      try {
+        console.log(`🤖 Starting Haiku rewriting with conversation history (${conversationHistory.length} messages)...`);
+        
+        rewriteResult = await haikuRewriter.rewriteQuery(question, {
+          chatHistory: conversationHistory,
+          episodeContext: {
+            episode_id: episodeId,
+            episode_title: `Episode ${episodeId}`, // We could fetch real metadata here
+            speakers: hostName
+          }
+        });
+
+                 if (rewriteResult.shouldUseRewritten) {
+           finalQuestion = rewriteResult.rewrittenQuery;
+           console.log(`📝 Using rewritten query: "${finalQuestion}"`);
+           console.log(`🎯 Detected intent: ${rewriteResult.intent} (confidence: ${rewriteResult.confidence})`);
+         } else {
+           console.log(`📝 Keeping original query (rewrite not beneficial)`);
+         }
+      } catch (error) {
+        console.warn('⚠️ Haiku rewriting failed, continuing with original query:', error);
+      }
+    }
 
     // Simple conversation context for enhanced RAG
     const context: ConversationContext = {
@@ -61,12 +95,12 @@ export async function POST(request: NextRequest) {
       },
     };
 
-    // Analyze question to determine RAG strategy
-    const questionAnalysis = analyzeQuestionForRAG(question);
+    // Analyze question to determine RAG strategy (use rewritten query if available)
+    const questionAnalysis = analyzeQuestionForRAG(finalQuestion);
     console.log(`🔍 Question analysis:`, questionAnalysis);
 
-    // Use enhanced RAG with real-time data capabilities
-    const response = await generateEnhancedRAGResponse(question, context, {
+    // Use enhanced RAG with real-time data capabilities (using final question)
+    const response = await generateEnhancedRAGResponse(finalQuestion, context, {
       maxRelevantChunks: 5,
       similarityThreshold: 0.6,
       includePersonality: questionAnalysis.contentTypes.includes('personality'),
@@ -95,6 +129,15 @@ export async function POST(request: NextRequest) {
         suggestions: response.suggestions,
         episodeId,
         enableRealTimeData,
+        queryRewrite: rewriteResult ? {
+          originalQuery: question,
+          rewrittenQuery: rewriteResult.rewrittenQuery,
+          intent: rewriteResult.intent,
+          confidence: rewriteResult.confidence,
+          usedRewritten: rewriteResult.shouldUseRewritten,
+          processingTimeMs: rewriteResult.processingTimeMs,
+          requiresRealTime: rewriteResult.requiresRealTime
+        } : null,
         ragContext: {
           transcriptChunks: response.ragContext?.relevantTranscripts?.length || 0,
           personalityData: response.ragContext?.personalityData?.length || 0,
@@ -146,6 +189,8 @@ export async function GET(request: NextRequest) {
         enableRealTimeData: 'Whether to fetch real-time data (default: true)',
         maxRealTimeTools: 'Maximum real-time tools to use (default: 2)',
         hostName: 'Host name for personality (default: AI Assistant)',
+        conversationHistory: 'Array of previous messages for context (optional)',
+        enableHaikuRewriting: 'Whether to use Haiku for query optimization (default: true)',
       },
     },
     examples: [

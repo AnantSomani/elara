@@ -2,10 +2,15 @@ import Anthropic from '@anthropic-ai/sdk';
 
 // Simple, focused interfaces for MVP
 export interface QueryRewriteOptions {
-  chatHistory?: string;
+  chatHistory?: string | any[];
   episodeTitle?: string;
   speakers?: string;
   channelTitle?: string;
+  episodeContext?: {
+    episode_id?: string;
+    episode_title?: string;
+    speakers?: string;
+  };
 }
 
 export interface RewriteResult {
@@ -17,20 +22,28 @@ export interface RewriteResult {
   processingTimeMs: number;
 }
 
-const HAIKU_SYSTEM_PROMPT = `You are a query optimization assistant for a podcast Q&A system. 
+const HAIKU_SYSTEM_PROMPT = `Rewrite vague queries into clear, standalone questions. Resolve pronouns using context. Detect intent.
 
-Your job:
-1. Rewrite vague/conversational questions into clear, standalone queries
-2. Resolve pronouns using chat history and context
-3. Detect user intent for smart routing
-4. Only rewrite when it genuinely improves the query
+CRITICAL: When a question refers to something discussed in the conversation history (using "this", "that", "it", "these"), classify as "episode_content" or "find_quote" - NOT "get_opinion". Sometimes, queries will use this, that, it, these, but they are referring to something that is an external source. In this case, use get_opinion.
 
-Intent types: summarize, fact_check, compare, find_quote, get_opinion, current_info, episode_content
+ONLY rewrite if the query is actually vague or has pronouns/unclear references. Don't rewrite clear, specific queries.
 
-Return JSON only:
+Intent Classification Rules:
+
+- "summarize": Requests for summaries or overviews
+- "fact_check": Questions about current/recent facts that may need verification  
+- "compare": Comparing different topics, people, or concepts
+- "find_quote": Looking for specific quotes or statements from the episode
+- "get_opinion": Asking about someone's personal opinion (only when explicitly asking for opinions)
+- "current_info": Questions about what's happening NOW (real-time events)
+- "episode_content": Questions about the episode content, including follow-up questions with "this", "that", "it"
+
+CONTEXT AWARENESS: If the question references something from history using pronouns/demonstratives ("this led to", "what did this mean", "thoughts about that"), classify as "episode_content".
+
+Return JSON:
 {
-  "rewritten_query": "improved query text",
-  "intent": "intent_category", 
+  "rewritten_query": "clear query",
+  "intent": "intent_type", 
   "confidence": 0.85,
   "requires_real_time": false,
   "should_use_rewritten": true
@@ -55,13 +68,20 @@ export class HaikuQueryRewriter {
       
       console.log(`🤖 Haiku rewriting: "${userInput}"`);
       
-      const response = await this.anthropic.messages.create({
+      // Add timeout to prevent hanging
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('Haiku timeout after 3s')), 3000);
+      });
+      
+      const apiPromise = this.anthropic.messages.create({
         model: 'claude-3-haiku-20240307',
-        max_tokens: 200,
-        temperature: 0.3,
+        max_tokens: 100,  // Reduced from 200
+        temperature: 0.1,  // Reduced for faster, more focused responses
         system: HAIKU_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: prompt }]
       });
+      
+      const response = await Promise.race([apiPromise, timeoutPromise]);
 
       const result = this.parseResponse(response, userInput, startTime);
       
@@ -83,19 +103,28 @@ export class HaikuQueryRewriter {
   }
 
   private buildPrompt(userInput: string, options: QueryRewriteOptions): string {
-    const { chatHistory = '', episodeTitle = 'Unknown', speakers = 'Unknown', channelTitle = 'Unknown' } = options;
+    const { chatHistory = '', episodeTitle = 'Unknown', speakers = 'Unknown', channelTitle = 'Unknown', episodeContext } = options;
+    
+    // Format chat history
+    const formattedHistory = Array.isArray(chatHistory) 
+      ? chatHistory.map(msg => `${msg.role}: ${msg.content}`).join('\n')
+      : chatHistory;
+    
+    // Use episodeContext if provided, otherwise fallback to individual options
+    const contextTitle = episodeContext?.episode_title || episodeTitle;
+    const contextSpeakers = episodeContext?.speakers || speakers;
     
     return `<input>
 ${userInput}
 </input>
 
 <history>
-${chatHistory}
+${formattedHistory}
 </history>
 
 <context>
-Episode: ${episodeTitle}
-Speakers: ${speakers}
+Episode: ${contextTitle}
+Speakers: ${contextSpeakers}
 Channel: ${channelTitle}
 </context>`;
   }
@@ -112,7 +141,7 @@ Channel: ${channelTitle}
         intent: parsed.intent || 'unknown',
         confidence: parsed.confidence || 0.5,
         requiresRealTime: parsed.requires_real_time || false,
-        shouldUseRewritten: parsed.should_use_rewritten && parsed.confidence > 0.7,
+        shouldUseRewritten: parsed.should_use_rewritten && parsed.confidence > 0.7 && this.isRewriteWorthwhile(originalQuery, parsed.rewritten_query),
         processingTimeMs
       };
     } catch (error) {
@@ -130,6 +159,30 @@ Channel: ${channelTitle}
       shouldUseRewritten: false,
       processingTimeMs: Date.now() - startTime
     };
+  }
+
+  private isRewriteWorthwhile(original: string, rewritten: string): boolean {
+    // Don't rewrite if the queries are very similar
+    if (original.length > 50 && rewritten.length / original.length < 1.2) {
+      return false;
+    }
+    
+    // Don't rewrite very short queries unless they have clear pronouns
+    if (original.length < 10 && !/\b(he|she|it|they|this|that)\b/i.test(original)) {
+      return false;
+    }
+    
+    // Always rewrite if it contains pronouns
+    if (/\b(he|she|it|they|this|that)\b/i.test(original)) {
+      return true;
+    }
+    
+    // Don't rewrite if original is already very specific
+    if (original.length > 60 && original.includes('specific') || original.includes('exactly')) {
+      return false;
+    }
+    
+    return true;
   }
 }
 

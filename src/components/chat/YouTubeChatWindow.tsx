@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
-import { PaperAirplaneIcon, ExclamationTriangleIcon } from '@heroicons/react/24/outline'
+import { PaperAirplaneIcon, ExclamationTriangleIcon, ArrowPathIcon } from '@heroicons/react/24/outline'
 import VoiceControls, { VoiceControlsRef } from './VoiceControls'
 import type { YouTubeChatMessage } from '@/types/youtube-chat'
 
@@ -228,6 +228,27 @@ export default function YouTubeChatWindow({
     return `$${cost.toFixed(4)}`
   }
 
+  const resetChat = () => {
+    console.log(`🔄 [RESET] Resetting chat for video: ${videoId}`)
+    
+    // 1. Clear all React state
+    setMessages([])
+    setConversationHistory([])
+    setSessionCost(0)
+    setCurrentMessage('')
+    
+    // 2. Clear localStorage
+    const savedChatKey = `elara-chat-${videoId}`
+    localStorage.removeItem(savedChatKey)
+    console.log(`🔄 [RESET] Cleared localStorage: ${savedChatKey}`)
+    
+    // 3. Generate completely new session ID
+    const newSessionId = `${videoId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+    setSessionId(newSessionId)
+    
+    console.log(`🔄 [RESET] Chat reset complete. New session: ${newSessionId}`)
+  }
+
   return (
     <div className="flex flex-col h-full">
       {/* Header with transcript status */}
@@ -238,21 +259,33 @@ export default function YouTubeChatWindow({
             <p className="text-sm text-slate-600">Ask about "{videoTitle}"</p>
           </div>
           
-          <div className="text-right">
-            {transcriptAvailable !== null && (
-              <div className={`inline-flex items-center px-2 py-1 rounded-full text-xs ${
-                transcriptAvailable 
-                  ? 'bg-green-100 text-green-800' 
-                  : 'bg-yellow-100 text-yellow-800'
-              }`}>
-                {transcriptAvailable ? '✅ Transcript Available' : '⚠️ No Transcript'}
-              </div>
-            )}
-            {sessionCost > 0 && (
-              <div className="text-xs text-slate-500 mt-1">
-                Session cost: {formatCost(sessionCost)}
-              </div>
-            )}
+          <div className="flex items-center space-x-3">
+            <div className="text-right">
+              {transcriptAvailable !== null && (
+                <div className={`inline-flex items-center px-2 py-1 rounded-full text-xs ${
+                  transcriptAvailable 
+                    ? 'bg-green-100 text-green-800' 
+                    : 'bg-yellow-100 text-yellow-800'
+                }`}>
+                  {transcriptAvailable ? '✅ Transcript Available' : '⚠️ No Transcript'}
+                </div>
+              )}
+              {sessionCost > 0 && (
+                <div className="text-xs text-slate-500 mt-1">
+                  Session cost: {formatCost(sessionCost)}
+                </div>
+              )}
+            </div>
+            
+            {/* Reset Chat Button */}
+            <button
+              onClick={resetChat}
+              disabled={isLoading}
+              className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed group"
+              title="Reset conversation"
+            >
+              <ArrowPathIcon className="w-5 h-5 group-hover:rotate-180 transition-transform duration-200" />
+            </button>
           </div>
         </div>
       </div>
